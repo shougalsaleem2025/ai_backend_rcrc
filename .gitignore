@@ -1,0 +1,8 @@
+.env
+.env.*
+__pycache__/
+*.pyc
+*.sqlite3
+Logs/
+data/
+test_sql_connection_rcrc.py
