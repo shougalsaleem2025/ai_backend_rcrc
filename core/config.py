@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     observability_db_path: str = (
         "assistant_observability.sqlite3"
     )
+        # Feedback SQL Server
+    feedback_sql_server: str = ""
+    feedback_sql_database: str = "RCRC_AI_Feedback"
+    feedback_sql_driver: str = "ODBC Driver 18 for SQL Server"
+    feedback_sql_trust_server_certificate: bool = True
 
     # MCP servers
     mcp_enabled_servers: list[str] = [

@@ -11,6 +11,7 @@ Responsibilities:
 - Normalize data before it is returned to the LLM.
 """
 
+import asyncio
 import base64
 import json
 import re
@@ -497,13 +498,11 @@ class EmployeeAPIClient:
         The response shape is not documented in the collection, so this
         parser is intentionally defensive and never invents leave names.
         """
-        if not access_token:
-            raise EmployeeAuthenticationError("Employee access token is missing.")
-
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Accept": "application/json",
-        }
+        headers = {"Accept": "application/json"}
+        # Postman documents this GET as publicly callable. Supply bearer only
+        # when there is a verified token (do not force one for this endpoint).
+        if access_token:
+            headers["Authorization"] = f"Bearer {access_token}"
 
         try:
             response = await self._client.request(method="GET", url="/api/VacationTypes", headers=headers)
@@ -699,6 +698,8 @@ class EmployeeAPIClient:
             "mobile": mobile,
             "extension": first_value("ext", "extension", "phoneExt", "extensionNumber"),
             "employee_type": first_value("empType", "employeeType", "employee_type"),
+            "gender_ar": first_value("genderAr", "gender_ar", "genderArabic"),
+            "gender_en": first_value("genderEn", "gender_en", "genderEnglish", "gender"),
         }
 
         if profile.get("email") in (None, ""):
@@ -970,9 +971,11 @@ class EmployeeAPIClient:
         for meeting in meetings:
             if not isinstance(meeting, dict):
                 continue
-            normalized_meetings.append({
-                # Preserve the real meeting title from whichever field the
-                # deployed calendar API uses.
+
+            # Keep the complete verified API row so no calendar fields are lost.
+            normalized = dict(meeting)
+
+            normalized.update({
                 "subject": (
                     meeting.get("subject")
                     or meeting.get("Subject")
@@ -987,9 +990,59 @@ class EmployeeAPIClient:
                     or meeting.get("eventTitle")
                     or meeting.get("EventTitle")
                 ),
-                "start_time": _convert_utc_to_riyadh(meeting.get("startTime")),
-                "end_time": _convert_utc_to_riyadh(meeting.get("endTime")),
+                "start_time": _convert_utc_to_riyadh(
+                    meeting.get("startTime")
+                    or meeting.get("StartTime")
+                    or meeting.get("start_time")
+                ),
+                "end_time": _convert_utc_to_riyadh(
+                    meeting.get("endTime")
+                    or meeting.get("EndTime")
+                    or meeting.get("end_time")
+                ),
+                "location": (
+                    meeting.get("location")
+                    or meeting.get("Location")
+                    or meeting.get("meetingLocation")
+                    or meeting.get("MeetingLocation")
+                ),
+                "organizer_name": (
+                    meeting.get("organizerName")
+                    or meeting.get("OrganizerName")
+                    or meeting.get("organizer")
+                    or meeting.get("Organizer")
+                ),
+                "my_response": (
+                    meeting.get("myResponse")
+                    or meeting.get("MyResponse")
+                    or meeting.get("response")
+                    or meeting.get("Response")
+                ),
+                "teams_link": (
+                    meeting.get("teamsLink")
+                    or meeting.get("TeamsLink")
+                    or meeting.get("joinUrl")
+                    or meeting.get("JoinUrl")
+                    or meeting.get("meetingUrl")
+                    or meeting.get("MeetingUrl")
+                    or meeting.get("onlineMeetingUrl")
+                    or meeting.get("OnlineMeetingUrl")
+                    or meeting.get("webLink")
+                    or meeting.get("WebLink")
+                ),
             })
+
+            # Debug only booleans; never print the URL/token itself.
+            print(
+                "[Meeting Fields] "
+                f"subject={bool(normalized.get('subject'))} "
+                f"location={bool(normalized.get('location'))} "
+                f"organizer={bool(normalized.get('organizer_name'))} "
+                f"response={bool(normalized.get('my_response'))} "
+                f"teams_link={bool(normalized.get('teams_link'))}"
+            )
+
+            normalized_meetings.append(normalized)
 
         return {
             "start_date": start_date,
@@ -1048,21 +1101,82 @@ class EmployeeAPIClient:
         elif isinstance(raw_attendance, dict) and raw_attendance:
             records = [raw_attendance]
 
-        # The current POC endpoint has been observed returning a record for a
-        # different employee. Before exposing attendance, verify the record
-        # name against the authenticated employee profile. If it cannot be
-        # verified, fail closed instead of showing another employee's data.
+        # Verify today's attendance against the authenticated employee.
+        # Prefer stable employee codes because the todayAttendance endpoint may
+        # return a shortened/placeholder name even when the record is correct.
         if records:
+            record = records[0]
+
+            record_code = str(
+                record.get("empCode")
+                or record.get("userCode")
+                or record.get("employeeCode")
+                or ""
+            ).strip()
+
+            try:
+                raw_profile = await self.get_my_profile_row(
+                    username=username,
+                    access_token=access_token,
+                )
+            except EmployeeAPIError:
+                raw_profile = {}
+
+            profile_code = str(
+                raw_profile.get("userCode")
+                or raw_profile.get("empCode")
+                or raw_profile.get("employeeCode")
+                or ""
+            ).strip() if isinstance(raw_profile, dict) else ""
+
+            if record_code and profile_code:
+                if record_code != profile_code:
+                    print(
+                        "[Today Attendance Identity Guard] "
+                        f"code mismatch expected={profile_code!r} returned={record_code!r}"
+                    )
+                    return {"attendance": [], "identity_mismatch": True}
+
+                return {"attendance": records, "identity_mismatch": False}
+
+            # Fallback to username only when codes are unavailable.
+            record_username = str(
+                record.get("userid")
+                or record.get("username")
+                or record.get("userName")
+                or ""
+            ).strip()
+            profile_username = str(
+                raw_profile.get("userid")
+                or raw_profile.get("username")
+                or raw_profile.get("userName")
+                or ""
+            ).strip() if isinstance(raw_profile, dict) else ""
+
+            if record_username and profile_username:
+                if record_username.casefold() != profile_username.casefold():
+                    print(
+                        "[Today Attendance Identity Guard] "
+                        f"username mismatch expected={profile_username!r} returned={record_username!r}"
+                    )
+                    return {"attendance": [], "identity_mismatch": True}
+
+                return {"attendance": records, "identity_mismatch": False}
+
+            # Last resort: compare names only when no stable identifier exists.
             record_name = str(
-                records[0].get("name")
-                or records[0].get("employeeName")
-                or records[0].get("empName")
+                record.get("name")
+                or record.get("employeeName")
+                or record.get("empName")
                 or ""
             ).strip()
 
             if record_name:
                 try:
-                    profile = await self.get_employee_profile(username=username, access_token=access_token)
+                    profile = await self.get_employee_profile(
+                        username=username,
+                        access_token=access_token,
+                    )
                 except EmployeeAPIError:
                     profile = {}
 
@@ -1082,7 +1196,11 @@ class EmployeeAPIClient:
                     normalize_name(name) for name in expected_names if normalize_name(name)
                 }
 
-                if not normalized_expected or normalized_record_name not in normalized_expected:
+                if normalized_expected and normalized_record_name not in normalized_expected:
+                    print(
+                        "[Today Attendance Identity Guard] "
+                        f"name mismatch returned={record_name!r}"
+                    )
                     return {"attendance": [], "identity_mismatch": True}
 
         return {"attendance": records, "identity_mismatch": False}
@@ -1374,22 +1492,44 @@ class EmployeeAPIClient:
             "", cleaned_search, flags=re.I,
         ).strip()
 
-        # Be tolerant of repeated conversational search prefixes that may reach
-        # this layer, e.g. "موظف باسم ابحث لي عن عدنان العقيلي".
-        # Strip only search/filler wording; never alter the actual employee name.
+        # Be tolerant of repeated conversational/search filler that may reach
+        # this layer from semantic parsing. The directory API must receive only
+        # the employee name, never phrases such as:
+        # "ابحث عن موظف باسم ابي اوس الدعجان ه".
         previous = None
         while cleaned_search and cleaned_search != previous:
             previous = cleaned_search
+
             cleaned_search = re.sub(
-                r"^(?:(?:ابي|أبي|ابغى|أبغى)\s+)?"
-                r"(?:ابحث|أبحث|دور|دوّر|دورلي|دور\s+لي|ابحث\s+لي|أبحث\s+لي|find|search(?:\s+for)?)"
-                r"\s+(?:لي\s+)?(?:عن\s+)?",
-                "", cleaned_search, flags=re.I,
+                r"^(?:(?:ابي|أبي|ابغى|أبغى|اريد|أريد)\s+)?"
+                r"(?:ابحث|أبحث|إبحث|دور|دوّر|دورلي|دور\s+لي|ابحث\s+لي|أبحث\s+لي|"
+                r"find|search(?:\s+for)?)"
+                r"\s+(?:لي\s+)?(?:(?:عن|على)\s+)?",
+                "",
+                cleaned_search,
+                flags=re.I,
             ).strip()
+
             cleaned_search = re.sub(
-                r"^(?:(?:موظف(?:ه|ة)?|الموظف)\s+)?(?:باسم|اسم)\s+",
-                "", cleaned_search, flags=re.I,
+                r"^(?:(?:عن|على)\s+)?"
+                r"(?:(?:موظف(?:ه|ة)?|الموظف|شخص)\s+)?"
+                r"(?:(?:باسم|اسم|اسمه|إسمه)\s+)?",
+                "",
+                cleaned_search,
+                flags=re.I,
             ).strip()
+
+            # A request starter can remain after a generated search prefix.
+            cleaned_search = re.sub(
+                r"^(?:ابي|أبي|ابغى|أبغى|اريد|أريد)\s+",
+                "",
+                cleaned_search,
+                flags=re.I,
+            ).strip()
+
+        # Remove a stray one-letter Arabic possessive artifact occasionally
+        # produced by a local semantic rewrite. Real name tokens are left intact.
+        cleaned_search = re.sub(r"\s+ه$", "", cleaned_search).strip()
 
         if not cleaned_search:
             raise EmployeeAPIError("Employee search text is required.")
@@ -1426,17 +1566,21 @@ class EmployeeAPIClient:
 
         prefer_arabic = any("\u0600" <= character <= "\u06ff" for character in cleaned_search)
 
-        async def fetch_rows(api_search: str) -> list[Any]:
-            """Use the deployed, verified SearchEmployee request shape only."""
+        async def fetch_rows(api_search: str, *, directory_snapshot: bool = False) -> list[Any]:
+            """Use the deployed, verified SearchEmployee request shape only.
+
+            The current API returns the full employee directory for an empty search.
+            We use that as the preferred source for local name matching. Named
+            server-side search remains a fallback for compatibility.
+            """
             api_search = re.sub(r"[؟?،,؛;:!…]+$", "", str(api_search or "").strip()).strip()
-            if not api_search:
-                return []
+            batch_value = "5000" if directory_snapshot else ""
 
             data = await self._request(
                 method="POST",
                 endpoint="/api/SearchEmployee/searchEmployeesList",
                 access_token=access_token,
-                form_fields={"search": api_search, "batchSize": "5000"},
+                form_fields={"search": api_search, "batchSize": batch_value},
             )
 
             if isinstance(data, dict):
@@ -1468,7 +1612,11 @@ class EmployeeAPIClient:
                 if isinstance(row, dict)
             ]
             rows = [row for row in rows if row]
-            print(f"[SearchEmployee] mode='form' search={api_search!r} batchSize='5000' rows={len(rows)}")
+            mode = "directory_snapshot" if directory_snapshot else "named_search"
+            print(
+                f"[SearchEmployee] mode={mode!r} search={api_search!r} "
+                f"batchSize={batch_value!r} rows={len(rows)}"
+            )
             return rows
 
         def merge_unique(destination: list[dict[str, Any]], incoming: list[Any], seen: set[str]) -> None:
@@ -1596,11 +1744,28 @@ class EmployeeAPIClient:
         all_rows: list[dict[str, Any]] = []
         seen: set[str] = set()
 
-        full_rows = await fetch_rows(cleaned_search)
-        merge_unique(all_rows, full_rows, seen)
+        # Prefer the verified full-directory response from an empty search, then
+        # perform matching locally. This makes employee lookup independent of
+        # inconsistent server-side name-search behavior.
+        try:
+            directory_rows = await fetch_rows("", directory_snapshot=True)
+        except (EmployeeAuthenticationError, EmployeeAuthorizationError):
+            raise
+        except EmployeeAPIError as exc:
+            print(f"[SearchEmployee Directory Snapshot] failed: {exc}")
+            directory_rows = []
+
+        merge_unique(all_rows, directory_rows, seen)
         matched_employees = normalize_matches(all_rows)
 
-        # If local verification found no actual match, retry with individual
+        # Compatibility fallback: if the directory snapshot did not contain a
+        # match, try the server-side named search and merge verified rows.
+        if not matched_employees:
+            full_rows = await fetch_rows(cleaned_search)
+            merge_unique(all_rows, full_rows, seen)
+            matched_employees = normalize_matches(all_rows)
+
+        # If local verification still found no actual match, retry with individual
         # tokens (family name first, then first name), merge, and verify the
         # COMPLETE requested name again.
         if not matched_employees and len(query_tokens) > 1:
@@ -1758,7 +1923,7 @@ class EmployeeAPIClient:
             method="POST",
             endpoint="/api/SearchEmployee/searchEmployeesList",
             access_token=access_token,
-            form_fields={"search": "", "batchSize": "5000"},
+            form_fields={"search": "", "batchSize": ""},
         )
         page_rows = extract_rows(page_data)
         page_rows = [
@@ -2000,16 +2165,38 @@ class EmployeeAPIClient:
     async def get_employee_attendance(
         self, *, username: str, access_token: str, start_date: str, end_date: str,
     ) -> dict[str, Any]:
-        data = await self._request(
-            method="POST",
-            endpoint="/api/EmployeeAttendance/getEmployeeAttendanceByUsername",
-            access_token=access_token,
-            form_fields={"username": username, "startDate": start_date, "endDate": end_date},
-        )
+        request_args = {
+            "method": "POST",
+            "endpoint": "/api/EmployeeAttendance/getEmployeeAttendanceByUsername",
+            "access_token": access_token,
+            "form_fields": {
+                "username": username,
+                "startDate": start_date,
+                "endDate": end_date,
+            },
+        }
+
+        # This legacy endpoint can occasionally fail at the transport layer
+        # while the rest of the Employee API remains reachable. Retry once
+        # only for connection/timeout failures; never retry auth/403/HTTP errors.
+        try:
+            data = await self._request(**request_args)
+        except EmployeeAPIError as exc:
+            message = str(exc)
+            if message not in {
+                "Could not connect to the Employee API.",
+                "Employee API request timed out.",
+            }:
+                raise
+            await asyncio.sleep(0.25)
+            data = await self._request(**request_args)
+
         return {
             "start_date": start_date,
             "end_date": end_date,
-            "records": self._normalize_collection(data, "attendance", "employeeAttendance", "attendanceList"),
+            "records": self._normalize_collection(
+                data, "attendance", "employeeAttendance", "attendanceList"
+            ),
         }
 
     # ==================================================================
@@ -2023,7 +2210,7 @@ class EmployeeAPIClient:
             method="POST",
             endpoint="/api/WorkingHours/WorkingHours",
             access_token=access_token,
-            form_fields={"username": username, "startDate": start_date, "endDate": end_date},
+            form_fields={"username": username, "startDate": _api_us_date(start_date), "endDate": _api_us_date(end_date)},
         )
         return {
             "start_date": start_date,
@@ -2110,9 +2297,9 @@ class EmployeeAPIClient:
     ) -> dict[str, Any]:
         data = await self._request(
             method="POST",
-            endpoint="/api/IntersectedVacations/intersectedVacations",
+            endpoint="/api/intersectedVacations",
             access_token=access_token,
-            form_fields={"username": username, "startDate": start_date, "endDate": end_date},
+            form_fields={"username": username, "startDate": _api_us_date(start_date), "endDate": _api_us_date(end_date)},
         )
         return {
             "start_date": start_date,
@@ -2128,123 +2315,44 @@ class EmployeeAPIClient:
     # employeeDetails and managerDetails.
     # ==================================================================
 
-    async def get_reporting_employees(self, *, username: str, access_token: str) -> dict[str, Any]:
-        """Return the verified direct reports of ``username`` from employeeFullDetails."""
+    async def get_reporting_employees(
+        self,
+        *,
+        username: str,
+        access_token: str,
+    ) -> dict[str, Any]:
+        """Return direct reports using the username-only ReportingEmployees API."""
         cleaned_username = str(username or "").strip()
         if not cleaned_username:
             raise EmployeeAPIError("Employee username is required.")
 
-        employee_keys = {
-            "userid", "username", "userName", "userCode", "empCode",
-            "namea", "namel", "nameAr", "nameEn",
-            "employeeName", "empName", "fullName", "name",
-            "jodesca", "jodesce", "jobTitleAr", "jobTitleEn",
-        }
-
-        def looks_like_employee(row: Any) -> bool:
-            return isinstance(row, dict) and bool({str(key) for key in row.keys()}.intersection(employee_keys))
-
-        def find_lists(value: Any, path: str, depth: int = 0) -> list[tuple[str, list[dict[str, Any]]]]:
-            """Every list of employee-like rows in the payload, with its path."""
-            if depth > 7:
-                return []
-            found: list[tuple[str, list[dict[str, Any]]]] = []
-            if isinstance(value, list):
-                people = [item for item in value if looks_like_employee(item)]
-                if people:
-                    found.append((path, people))
-                for index, item in enumerate(value[:50]):
-                    if isinstance(item, (dict, list)):
-                        found.extend(find_lists(item, f"{path}[{index}]", depth + 1))
-            elif isinstance(value, dict):
-                for key, nested in value.items():
-                    if depth == 0 and str(key) == "managerDetails":
-                        continue
-                    if isinstance(nested, (dict, list)):
-                        found.extend(find_lists(nested, f"{path}.{key}" if path else str(key), depth + 1))
-            return found
-
-        data = await self._full_details(username=cleaned_username, access_token=access_token)
-        data = _require_dict(data, "Employee full details response is invalid.")
-
-        # Identity guard: never attribute someone else's team to this employee.
-        details = data.get("employeeDetails")
-        subject_name = ""
-        if isinstance(details, dict):
-            returned_username = str(details.get("userid") or details.get("username") or "").strip().casefold()
-            if returned_username and returned_username != cleaned_username.casefold():
-                print(
-                    "[ReportingEmployees Identity Guard] "
-                    f"expected={cleaned_username!r} returned={returned_username!r}"
-                )
-                raise EmployeeAPIError("employeeFullDetails returned a different employee.")
-            subject_name = str(details.get("namea") or details.get("namel") or "").strip()
-
-        # Structure of the response (key names and list sizes only, no values).
-        outline = {
-            str(key): (
-                f"list[{len(value)}]" if isinstance(value, list)
-                else "object" if isinstance(value, dict)
-                else "value"
-            )
-            for key, value in data.items()
-        }
-
-        candidates = find_lists(data, "")
-        # Prefer a list under a reports-like key, then the largest list.
-        report_hint = re.compile(r"(?:report|sub|team|direct|employees|staff|members|subordinat)", re.I)
-        candidates.sort(
-            key=lambda item: (1 if report_hint.search(item[0]) else 0, len(item[1])),
-            reverse=True,
+        data = await self._request(
+            method="POST",
+            endpoint="/api/ReportingEmployees/reportingEmployees",
+            access_token=access_token,
+            form_fields={
+                "username": cleaned_username,
+            },
         )
 
-        rows: list[dict[str, Any]] = []
-        list_key = ""
-        if candidates:
-            list_key, rows = candidates[0]
-
-        # Remove the employee himself and duplicates.
-        out: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for row in rows:
-            identity = str(
-                row.get("userid")
-                or row.get("username")
-                or row.get("userName")
-                or row.get("userCode")
-                or row.get("empCode")
-                or row.get("namea")
-                or row.get("employeeName")
-                or row.get("name")
-                or ""
-            ).strip().casefold()
-            if not identity or identity in seen or identity == cleaned_username.casefold():
-                continue
-            seen.add(identity)
-            out.append(row)
-
-            # Cache verified identities for later exact lookups.
-            verified_username = str(row.get("userid") or row.get("username") or "").strip()
-            verified_code = str(row.get("userCode") or row.get("empCode") or "").strip()
-            verified_name = str(row.get("namea") or row.get("namel") or "").strip()
-            if verified_username and verified_code:
-                self._employee_code_by_username[verified_username.casefold()] = verified_code
-            if verified_username and verified_name:
-                self._employee_name_by_username[verified_username.casefold()] = verified_name
+        employees = self._normalize_collection(
+            data,
+            "employees",
+            "reportingEmployees",
+            "employeeList",
+        )
 
         print(
-            "[ReportingEmployees FullDetails] "
-            f"username={cleaned_username!r} data={outline} "
-            f"list_key={list_key!r} rows={len(out)}"
+            "[ReportingEmployees] "
+            f"username={cleaned_username!r} rows={len(employees)}"
         )
 
         return {
-            "employees": out,
+            "employees": employees,
             "requested_username": cleaned_username,
             "source_identifier": cleaned_username,
-            "source": "employeeFullDetails",
-            "list_key": list_key,
-            "subject_name": subject_name,
+            "source": "ReportingEmployees",
+            "list_key": "reportingEmployees",
         }
 
     # ==================================================================
@@ -2258,7 +2366,7 @@ class EmployeeAPIClient:
             method="POST",
             endpoint="/api/SubEmployeesAttendance/getSubEmployeesAttendance",
             access_token=access_token,
-            form_fields={"username": username, "startDate": start_date, "endDate": end_date},
+            form_fields={"username": username, "startDate": _api_us_date(start_date), "endDate": _api_us_date(end_date)},
         )
         return {
             "start_date": start_date,
@@ -2632,7 +2740,7 @@ class EmployeeAPIClient:
             method="POST",
             endpoint="/api/MeetingList/myMeetings",
             access_token=access_token,
-            form_fields={"username": username, "startDate": start_date, "endDate": end_date},
+            form_fields={"username": username, "startDate": _api_us_date(start_date), "endDate": _api_us_date(end_date)},
         )
         return {
             "start_date": start_date,

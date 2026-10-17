@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import json
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from typing import Any
 
-from core.llm_client import chat
+from core.allam_semantic_backend import semantic_chat
+from core.organization_resolver import find_unit_alias
 from core.semantic_models import ParsedRequest, TargetRef
 
-SEMANTIC_PARSER_BUILD = "rcrc-v163-context-api-routing-fixes-2026-10-03"
+SEMANTIC_PARSER_BUILD = "rcrc-v248-selection-language-fix-2026-10-15"
 
 
 
@@ -26,6 +28,7 @@ _DEPARTMENT_QUERY_ALIASES: tuple[tuple[str, str], ...] = (
     (r"\b(?:it|i\s*\.?t\.?|ict)\b", "التقنية والرقمنة"),
     (r"\b(?:information\s+technology|technology\s+and\s+(?:digitization|digitalization)|digital\s+technology)\b", "التقنية والرقمنة"),
     (r"\b(?:hr|h\s*\.?r\.?|human\s+resources?|people\s+and\s+culture)\b", "الموارد البشرية"),
+    (r"\b(?:ia|i\s*\.?a\.?|internal\s+audit|internal\s+auditing)\b", "المراجعة الداخلية"),
     (r"\b(?:finance|financial(?:\s+affairs)?)\b", "المالية"),
     (r"\b(?:legal|legal\s+affairs)\b", "الشؤون القانونية"),
     (r"\b(?:procurement|purchasing)\b", "المشتريات"),
@@ -39,6 +42,9 @@ def _extract_department_alias(message: str) -> str:
     raw = " ".join(str(message or "").strip().split())
     if not raw:
         return ""
+    central = find_unit_alias(raw)
+    if central:
+        return central.canonical_query
     normalized = _normalize_for_semantic_guards(raw)
     for pattern, canonical_query in _DEPARTMENT_QUERY_ALIASES:
         if re.search(pattern, normalized, flags=re.I):
@@ -95,6 +101,18 @@ def _name_is_literal_in_message(name: str, message: str) -> bool:
         message_tokens[i:i + width] == target_tokens
         for i in range(0, max(0, len(message_tokens) - width + 1))
     )
+
+
+def _strip_discourse_prefix(text: str) -> str:
+    """Remove conversational acknowledgements without changing the business meaning."""
+    value = " ".join(str(text or "").strip().split())
+    value = re.sub(
+        r"^(?:(?:ايوا|ايوه|ايه|إيه|نعم|تمام|طيب|اوكي|أوكي|okay|ok)\s+)+",
+        "",
+        value,
+        flags=re.I,
+    ).strip()
+    return value
 
 
 def _is_anaphoric_reference(message: str) -> bool:
@@ -285,6 +303,20 @@ def _repair_role_and_list_context(
     """
     req = request.model_copy(deep=True)
     has_focus = _has_verified_focus(state)
+
+    named_contact = _extract_named_employee_contact_request(message)
+    if named_contact is not None:
+        employee_name, requested_fields = named_contact
+        req.intent = "employee_details"
+        req.operation = "details"
+        req.targets = [TargetRef(kind="employee", name=employee_name)]
+        req.fields = requested_fields
+        req.query = ""
+        req.role_query = ""
+        req.department_query = ""
+        req.clarification_reason = ""
+        req.confidence = max(float(req.confidence or 0.0), 0.99)
+        return req
     raw = " ".join(str(message or "").strip().split())
 
     # Direct organisational role question, e.g.:
@@ -481,8 +513,56 @@ def _apply_semantic_invariants(request: ParsedRequest, message: str, state: dict
             req.end_date = ""
             req.clarification_reason = "missing_date_range"
 
-    if req.intent in {"meetings", "meeting_list", "attendance_today", "attendance_history", "working_hours"}:
+    if req.intent in {"meetings", "meeting_list"}:
+        # A short time-window answer is a continuation of the selected meeting
+        # date, not a new request for today. Preserve the structural date from
+        # pending/meeting_context when the current message only supplies time.
+        if not req.time_query:
+            req.time_query = _extract_time_query(message)
+
         if not _has_explicit_period_cue(message):
+            inherited = False
+            if req.time_query:
+                pending = state.get("pending") if isinstance(state.get("pending"), dict) else {}
+                raw_pending = pending.get("request") if isinstance(pending.get("request"), dict) else {}
+                if str(pending.get("kind") or "") == "meeting_time_window" and raw_pending:
+                    req.period = str(raw_pending.get("period") or "none")
+                    req.start_date = str(raw_pending.get("start_date") or "")
+                    req.end_date = str(raw_pending.get("end_date") or "")
+                    inherited = req.period not in {"", "none"}
+
+                if not inherited:
+                    meeting_context = state.get("meeting_context") if isinstance(state.get("meeting_context"), dict) else {}
+                    if (
+                        str(meeting_context.get("subject_kind") or "") == "self"
+                        and str(meeting_context.get("mode") or "").startswith("self_meetings")
+                    ):
+                        req.period = str(meeting_context.get("period") or "none")
+                        req.start_date = str(meeting_context.get("start_date") or "")
+                        req.end_date = str(meeting_context.get("end_date") or "")
+                        inherited = req.period not in {"", "none"}
+
+            if inherited:
+                req.clarification_reason = ""
+                req.confidence = max(float(req.confidence or 0.0), 0.99)
+            else:
+                req.period = "none"
+                req.start_date = ""
+                req.end_date = ""
+                req.clarification_reason = "missing_date_range"
+
+    if req.intent in {"attendance_today", "attendance_history", "working_hours"}:
+        if _has_explicit_period_cue(message):
+            attendance_period, attendance_start, attendance_end = _attendance_period(message)
+            if attendance_period != "none":
+                req.period = attendance_period
+                req.start_date = attendance_start
+                req.end_date = attendance_end
+                if req.intent != "working_hours":
+                    req.intent = "attendance_today" if attendance_start == attendance_end == _riyadh_today().isoformat() else "attendance_history"
+                req.clarification_reason = ""
+                req.confidence = max(float(req.confidence or 0.0), 0.99)
+        else:
             req.period = "none"
             req.start_date = ""
             req.end_date = ""
@@ -707,10 +787,36 @@ Do not classify:
 "ابرز المزايا الي تقدمها الهيئة"
 as general if it refers to the Mazaya/benefits service.
 
-GENERAL INFORMATION
+GENERAL / OPEN-ENDED ASSISTANT QUESTIONS
+Use intent="general" for normal questions that do not require verified/private
+enterprise data. This is a broad capability, not only small talk.
+
+Examples that are GENERAL:
+- "وش MCP؟"
+- "وش الفرق بين API و endpoint؟"
+- "اشرح لي load balancer"
+- "كيف أكتب ايميل رسمي؟"
+- "عطني مثال على FastAPI"
+- "ليش نستخدم cache؟"
+- "لخص لي هالكلام"
+- "ترجمها بالإنجليزي"
+- ordinary coding, AI, architecture, writing, language, reasoning, brainstorming,
+  definitions, public/general knowledge, and conversational follow-ups.
+
+A question may mention RCRC or work context and still be general when it asks for
+an explanation or drafting task and does NOT require a fresh internal fact.
+
+Use an enterprise intent whenever answering requires verified RCRC data such as a
+specific employee, manager, directory membership/count, leave, attendance,
+meetings, Tarasol, policy content, announcements, news, Mazaya, or HR-letter data.
+
 Organization-level explanatory questions such as achievements, projects, goals,
-vision, mission, or general writing/explanation may be general.
+vision, mission, or general writing/explanation may be general unless the user is
+asking for current internal facts that require a supported enterprise source.
 Do not treat phrases like "ابرز انجازات الهيئة" as employee names.
+
+When the message is understandable but does not fit a supported enterprise domain,
+prefer general over inventing an employee/system intent.
 
 CONVERSATION-FIRST UNDERSTANDING
 You receive RECENT_DIALOGUE in DIALOGUE_CONTEXT.
@@ -727,6 +833,15 @@ Examples:
   interpret as duration context, not general chat.
 - User says "الأول", "الثاني", "هذا", "حقه", "مديره" after a verified list/focus =>
   resolve through structural verified context.
+- If PENDING_CONTEXT says a self-meetings request is waiting for a time window,
+  interpret the user's next natural reply as a continuation of that SAME meeting request.
+  Examples: "الصباح", "بعد الظهر", "بعد 2", "قبل الظهر", "من 10 إلى 12",
+  "أي وقت", or a correction such as "لا، الثلاثاء". Preserve the pending meeting
+  intent and date unless the user explicitly changes them. Do not ask for the date again
+  when it is already present in PENDING_CONTEXT.
+- A weekday-only follow-up such as "الثلاثاء؟" or "ابي يوم الثلاثاء" after a
+  meetings conversation means the user's own meetings on the nearest upcoming occurrence
+  of that weekday, unless the current message clearly changes the topic.
 
 IMPORTANT:
 - RECENT_DIALOGUE is only for conversational meaning and continuity.
@@ -943,6 +1058,34 @@ def _message_content(response: Any) -> Any:
     return ""
 
 
+def _normalize_intent_input(message: str) -> str:
+    """
+    Meaning-preserving cleanup used only for semantic understanding.
+
+    The original user text is never changed in conversation history. This
+    helper only makes common Arabic spacing/typing variants easier for the NLU
+    model and deterministic date parser to understand.
+    """
+    raw = " ".join(str(message or "").strip().split())
+    if not raw:
+        return raw
+
+    # Joined relative-day forms seen in chat typing.
+    replacements = (
+        (r"(الاحد|الأحد|الاثنين|الإثنين|الثلاثاء|الاربعاء|الأربعاء|الخميس|الجمعه|الجمعة|السبت)(الماضي)", r"\1 \2"),
+        (r"(الاحد|الأحد|الاثنين|الإثنين|الثلاثاء|الاربعاء|الأربعاء|الخميس|الجمعه|الجمعة|السبت)(الجاي|القادم)", r"\1 \2"),
+        (r"(الي|اللي)(فات|راح)", r"\1 \2"),
+    )
+    for pattern, replacement in replacements:
+        raw = re.sub(pattern, replacement, raw, flags=re.I)
+
+    # Safe conversational spelling normalization.
+    raw = re.sub(r"\biwant\b", "i want", raw, flags=re.I)
+    raw = re.sub(r"\bmanger\b", "manager", raw, flags=re.I)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    return raw
+
+
 def safe_state_for_parser(state: dict[str, Any]) -> dict[str, Any]:
     """Expose only structural dialogue context to the NLU model.
 
@@ -957,6 +1100,9 @@ def safe_state_for_parser(state: dict[str, Any]) -> dict[str, Any]:
     list_state = state.get("list_state") if isinstance(state.get("list_state"), dict) else {}
     last_request = state.get("last_request") if isinstance(state.get("last_request"), dict) else {}
     directory_context = state.get("directory_context") if isinstance(state.get("directory_context"), dict) else {}
+    conversation_context = state.get("conversation_context") if isinstance(state.get("conversation_context"), dict) else {}
+    pending = state.get("pending") if isinstance(state.get("pending"), dict) else {}
+    pending_request = pending.get("request") if isinstance(pending.get("request"), dict) else {}
 
     return {
         "has_focus": bool(current.get("username") or current.get("userid")),
@@ -970,6 +1116,17 @@ def safe_state_for_parser(state: dict[str, Any]) -> dict[str, Any]:
         "last_list_count": len(list_state.get("items") or []) if isinstance(list_state.get("items"), list) else 0,
         "has_general_department_context": bool(directory_context.get("general_department_key")),
         "last_directory_context_type": str(directory_context.get("type") or ""),
+        "conversation_context": {
+            "active_domain": str(conversation_context.get("active_domain") or ""),
+            "active_view": str(conversation_context.get("active_view") or ""),
+            "operation": str(conversation_context.get("operation") or ""),
+            "period": str(conversation_context.get("period") or "none"),
+            "start_date": str(conversation_context.get("start_date") or ""),
+            "end_date": str(conversation_context.get("end_date") or ""),
+            "time_query": str(conversation_context.get("time_query") or ""),
+            "fields": list(conversation_context.get("fields") or [])[:8],
+            "target_kind": str(conversation_context.get("target_kind") or ""),
+        } if conversation_context else {},
         "recent_dialogue": [
             {
                 "role": str(turn.get("role") or ""),
@@ -987,6 +1144,15 @@ def safe_state_for_parser(state: dict[str, Any]) -> dict[str, Any]:
             "time_window": str((state.get("task_flow") or {}).get("time_window") or ""),
             "duration_minutes": int((state.get("task_flow") or {}).get("duration_minutes") or 0),
         } if isinstance(state.get("task_flow"), dict) else {},
+        "pending_context": {
+            "kind": str(pending.get("kind") or ""),
+            "intent": str(pending_request.get("intent") or ""),
+            "period": str(pending_request.get("period") or "none"),
+            "start_date": str(pending_request.get("start_date") or ""),
+            "end_date": str(pending_request.get("end_date") or ""),
+            "time_query": str(pending_request.get("time_query") or ""),
+            "fields": list(pending_request.get("fields") or [])[:8],
+        } if pending else {},
     }
 
 
@@ -1043,6 +1209,15 @@ _OPERATION_ALIASES = {
     "query": "lookup",
     "get_info": "details",
     "get_profile": "details",
+    # Qwen occasionally emits natural verbs that are outside ParsedRequest's
+    # closed operation schema. Normalize harmless variants instead of throwing
+    # away the whole semantic result.
+    "info": "details",
+    "read": "details",
+    "email": "details",
+    "fetch": "list",
+    "retrieve": "lookup",
+    "browse": "list",
 }
 
 _TARGET_KIND_ALIASES = {
@@ -1068,7 +1243,14 @@ def _coerce_semantic_payload(value: dict[str, Any]) -> dict[str, Any]:
         data["intent"] = _INTENT_ALIASES[intent]
 
     operation = str(data.get("operation") or "").strip()
-    if operation in _OPERATION_ALIASES:
+
+    # A model may describe a writing action as send_email / compose / draft.
+    # Sanad does not send mail from this parser; these mean "help me write".
+    # Keep the user's original text in query and route to general writing mode.
+    if operation in {"send_email", "compose_email", "compose", "draft", "write", "rewrite"}:
+        data["intent"] = "general"
+        data["operation"] = "chat"
+    elif operation in _OPERATION_ALIASES:
         data["operation"] = _OPERATION_ALIASES[operation]
 
     raw_targets = data.get("targets")
@@ -1204,14 +1386,126 @@ def _ascii_digits(value: str) -> str:
     return str(value or "").translate(_ARABIC_DIGIT_TRANS)
 
 
-def _has_explicit_period_cue(message: str) -> bool:
+_MONTH_ALIASES: dict[str, int] = {
+    # Arabic / common Saudi spellings
+    "يناير": 1,
+    "فبراير": 2,
+    "مارس": 3,
+    "ابريل": 4,
+    "أبريل": 4,
+    "مايو": 5,
+    "يونيو": 6,
+    "يوليو": 7,
+    "اغسطس": 8,
+    "أغسطس": 8,
+    "اوقست": 8,
+    "أوقست": 8,
+    "سبتمبر": 9,
+    "اكتوبر": 10,
+    "أكتوبر": 10,
+    "نوفمبر": 11,
+    "ديسمبر": 12,
+
+    # English
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "sept": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+
+
+def _extract_month_range(message: str) -> tuple[str, str] | None:
+    """Resolve a month-only phrase into an explicit Riyadh-local date range.
+
+    Supports examples such as:
+      - شهر 8 / شهر ٨
+      - أغسطس / اغسطس / اوقست
+      - August / Aug
+      - أغسطس 2026 / August 2026
+
+    A month without an explicit year is interpreted as that month in the current
+    Riyadh year. This is deterministic and avoids relying on the LLM for dates.
+    """
     raw = _ascii_digits(str(message or ""))
     norm = _normalize_for_semantic_guards(raw)
+    if not norm:
+        return None
+
+    month: int | None = None
+
+    # Explicit numeric month. We deliberately require a month cue so a random
+    # number (employee count, extension, etc.) is never treated as a month.
+    numeric = re.search(r"(?:شهر|month)\s*(1[0-2]|0?[1-9])\b", norm, re.I)
+    if numeric:
+        month = int(numeric.group(1))
+
+    if month is None:
+        for alias, number in _MONTH_ALIASES.items():
+            alias_norm = _normalize_for_semantic_guards(alias)
+            if re.search(rf"(?<![0-9a-z\u0600-\u06ff]){re.escape(alias_norm)}(?![0-9a-z\u0600-\u06ff])", norm, re.I):
+                month = number
+                break
+
+    if month is None:
+        return None
+
+    year_match = re.search(r"\b(20\d{2})\b", raw)
+    if year_match:
+        year = int(year_match.group(1))
+    else:
+        year = datetime.now(timezone(timedelta(hours=3))).year
+
+    last_day = calendar.monthrange(year, month)[1]
+    return (
+        f"{year:04d}-{month:02d}-01",
+        f"{year:04d}-{month:02d}-{last_day:02d}",
+    )
+
+
+def _has_explicit_period_cue(message: str) -> bool:
+    """True when CURRENT_MESSAGE already contains a concrete/relative date cue.
+
+    Keep this intentionally broad for attendance/calendar language so a user who
+    already said a day or range is never asked for the date again.
+    """
+    raw = _ascii_digits(str(message or ""))
+    norm = _normalize_for_semantic_guards(raw)
+    if _extract_month_range(raw):
+        return True
     return bool(
         re.search(
-            r"(?:اليوم|بكره|بكرة|غدا|غداً|امس|أمس|هذا\s+الاسبوع|هالاسبوع|"
-            r"الاسبوع\s+الماضي|الأسبوع\s+الماضي|هذا\s+الشهر|الشهر\s+الماضي|"
-            r"today|tomorrow|yesterday|this\s+week|last\s+week|this\s+month|last\s+month)",
+            r"(?:اليوم|بكره|بكرة|غدا|غداً|امس|أمس|اول\s+امس|أول\s+أمس|قبل\s+امس|قبل\s+أمس|"
+            r"قبل\s+يومين|منذ\s+يومين|قبل\s+\d+\s*(?:يوم|يومين|ايام|أيام)|منذ\s+\d+\s*(?:يوم|يومين|ايام|أيام)|"
+            r"قبل\s+(?:اسبوع|أسبوع|اسبوعين|أسبوعين)|منذ\s+(?:اسبوع|أسبوع|اسبوعين|أسبوعين)|"
+            r"قبل\s+\d+\s*(?:اسبوع|أسبوع|اسابيع|أسابيع)|منذ\s+\d+\s*(?:اسبوع|أسبوع|اسابيع|أسابيع)|"
+            r"هذا\s+الاسبوع|هالاسبوع|الاسبوع\s+هذا|الأسبوع\s+هذا|الاسبوع\s+(?:الحالي|الماضي|اللي\s+فات|الي\s+فات|اللي\s+راح|الي\s+راح)|"
+            r"الأسبوع\s+(?:الحالي|الماضي|اللي\s+فات|الي\s+فات|اللي\s+راح|الي\s+راح)|الاسبوع\s+قبل\s+الماضي|الأسبوع\s+قبل\s+الماضي|"
+            r"اول\s+الاسبوع|أول\s+الأسبوع|بدايه\s+الاسبوع|بداية\s+الأسبوع|نهايه\s+الاسبوع|نهاية\s+الأسبوع|اخر\s+الاسبوع|آخر\s+الأسبوع|"
+            r"هذا\s+الشهر|الشهر\s+(?:الحالي|هذا|الماضي|اللي\s+فات|الي\s+فات)|آخر\s+\d+\s*(?:يوم|ايام|أيام|days)|اخر\s+\d+\s*(?:يوم|ايام|أيام|days)|"
+            r"الاحد|الأحد|احد|أحد|الاثنين|الإثنين|اثنين|الثلاثاء|ثلاثاء|"
+            r"الاربعاء|الأربعاء|اربعاء|أربعاء|الخميس|خميس|الجمعه|الجمعة|جمعه|جمعة|السبت|سبت|"
+            r"today|tomorrow|yesterday|day\s+before\s+yesterday|this\s+week|last\s+week|\d+\s+weeks?\s+ago|a\s+week\s+ago|this\s+month|last\s+month|"
+            r"sunday|monday|tuesday|wednesday|thursday|friday|saturday)",
             norm, re.I,
         )
         or re.search(r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b", raw)
@@ -1219,9 +1513,364 @@ def _has_explicit_period_cue(message: str) -> bool:
     )
 
 
+_WEEKDAY_INDEX = {
+    "الاثنين": 0, "الإثنين": 0, "اثنين": 0,
+    "الثلاثاء": 1, "ثلاثاء": 1,
+    "الاربعاء": 2, "الأربعاء": 2, "اربعاء": 2, "أربعاء": 2,
+    "الخميس": 3, "خميس": 3,
+    "الجمعه": 4, "الجمعة": 4, "جمعه": 4, "جمعة": 4,
+    "السبت": 5, "سبت": 5,
+    "الاحد": 6, "الأحد": 6, "احد": 6, "أحد": 6,
+    "monday": 0, "tuesday": 1, "wednesday": 2,
+    "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6,
+}
+
+
+def _named_weekday_date(message: str, *, direction: str = "auto") -> str:
+    """
+    Resolve a named weekday using Riyadh local date.
+
+    direction:
+      - "past": nearest occurrence strictly before today
+      - "future": nearest occurrence strictly after today
+      - "auto": today if it matches, otherwise nearest future occurrence
+
+    Arabic joined forms such as "الثلاثاءالماضي" are supported.
+    """
+    raw = " ".join(str(message or "").strip().split())
+    norm = _normalize_for_semantic_guards(raw)
+
+    target_index = None
+
+    for label, index in _WEEKDAY_INDEX.items():
+        if re.search(rf"(?<!\w){re.escape(label)}(?!\w)", norm, re.I):
+            target_index = index
+            break
+
+    if target_index is None:
+        for label, index in _WEEKDAY_INDEX.items():
+            if re.search(
+                rf"{re.escape(label)}(?:الماضي|الماضيه|اللي|الي|القادم|القادمه|الجاي|الجاية|الجايه)",
+                norm,
+                re.I,
+            ):
+                target_index = index
+                break
+
+    if target_index is None:
+        return ""
+
+    today = _riyadh_today()
+
+    if direction == "past":
+        delta = (today.weekday() - target_index) % 7
+        if delta == 0:
+            delta = 7
+        return (today - timedelta(days=delta)).isoformat()
+
+    if direction == "future":
+        delta = (target_index - today.weekday()) % 7
+        if delta == 0:
+            delta = 7
+        return (today + timedelta(days=delta)).isoformat()
+
+    delta = (target_index - today.weekday()) % 7
+    return (today + timedelta(days=delta)).isoformat()
+
+
+def _explicit_named_weekday_period(message: str) -> tuple[str, str, str] | None:
+    """Resolve explicit last/next named-weekday phrases before bare weekday logic."""
+    raw = _ascii_digits(str(message or ""))
+    norm = _normalize_for_semantic_guards(raw)
+
+    weekday_words = (
+        r"الاحد|الأحد|احد|أحد|الاثنين|الإثنين|اثنين|"
+        r"الثلاثاء|ثلاثاء|الاربعاء|الأربعاء|اربعاء|أربعاء|"
+        r"الخميس|خميس|الجمعه|الجمعة|جمعه|جمعة|السبت|سبت|"
+        r"sunday|monday|tuesday|wednesday|thursday|friday|saturday"
+    )
+
+    past_cue = bool(
+        re.search(
+            rf"(?:{weekday_words})\s*(?:الماضي|الماضيه|اللي\s*فات|الي\s*فات|اللي\s*راح|الي\s*راح)",
+            norm,
+            re.I,
+        )
+        or re.search(rf"(?:last|previous)\s+(?:{weekday_words})", norm, re.I)
+    )
+    if past_cue:
+        value = _named_weekday_date(raw, direction="past")
+        if value:
+            return "custom", value, value
+
+    future_cue = bool(
+        re.search(
+            rf"(?:{weekday_words})\s*(?:الجاي|القادم|القادمه|الجاية|الجايه)",
+            norm,
+            re.I,
+        )
+        or re.search(rf"(?:next)\s+(?:{weekday_words})", norm, re.I)
+    )
+    if future_cue:
+        value = _named_weekday_date(raw, direction="future")
+        if value:
+            return "custom", value, value
+
+    return None
+
+
+def _next_weekday_date(message: str) -> str:
+    """Return the nearest occurrence of a named weekday, today or later."""
+    return _named_weekday_date(message, direction="auto")
+
+
+def _riyadh_today():
+    return datetime.now(timezone(timedelta(hours=3))).date()
+
+
+def _attendance_week_bounds(anchor=None) -> tuple[str, str]:
+    """RCRC work-week bounds: Sunday..Thursday in Riyadh local time."""
+    day = anchor or _riyadh_today()
+    # Python Monday=0..Sunday=6. Convert to days since Sunday.
+    days_since_sunday = (day.weekday() + 1) % 7
+    start = day - timedelta(days=days_since_sunday)
+    end = start + timedelta(days=4)
+    return start.isoformat(), end.isoformat()
+
+
+def _attendance_named_weekday(message: str, *, force_previous_week: bool = False) -> str:
+    """Resolve a named weekday retrospectively for attendance questions.
+
+    Bare weekday -> nearest occurrence today or earlier.
+    "<weekday> الماضي/اللي فات/last <weekday>" -> occurrence in the previous
+    calendar week (or at least 7 days back when needed).
+    """
+    raw = " ".join(str(message or "").strip().split())
+    norm = _normalize_for_semantic_guards(raw)
+    target_index = None
+    for label, index in _WEEKDAY_INDEX.items():
+        if re.search(rf"(?<!\w){re.escape(label)}(?!\w)", norm, re.I):
+            target_index = index
+            break
+    if target_index is None:
+        return ""
+
+    today = _riyadh_today()
+    delta = (today.weekday() - target_index) % 7
+    result = today - timedelta(days=delta)
+
+    explicit_previous = bool(re.search(
+        r"(?:الماضي|الماضيه|اللي\s*فات|الي\s*فات|اللي\s*راح|الي\s*راح|last|previous)",
+        norm,
+        re.I,
+    ))
+
+    if explicit_previous:
+        delta = (today.weekday() - target_index) % 7
+        if delta == 0:
+            delta = 7
+        result = today - timedelta(days=delta)
+    elif force_previous_week:
+        result -= timedelta(days=7)
+
+    return result.isoformat()
+
+
+def _attendance_period(message: str) -> tuple[str, str, str]:
+    """Resolve natural retrospective date expressions for attendance.
+
+    Returns concrete custom dates whenever possible so the attendance API does
+    not need to reinterpret relative language later.
+    """
+    raw = _ascii_digits(str(message or ""))
+    norm = _normalize_for_semantic_guards(raw)
+    today = _riyadh_today()
+
+    month_range = _extract_month_range(raw)
+    if month_range:
+        return "custom", month_range[0], month_range[1]
+
+    # Exact relative days. Order matters: "اول امس" contains "امس".
+    if re.search(r"(?:اول\s+امس|أول\s+أمس|قبل\s+امس|قبل\s+أمس|day\s+before\s+yesterday)", raw, re.I):
+        d = today - timedelta(days=2)
+        return "custom", d.isoformat(), d.isoformat()
+    m = re.search(r"(?:قبل\s+|منذ\s+)(\d{1,3})\s*(?:يوم|ايام|أيام|days?)", norm, re.I)
+    if not m and re.search(r"(?:قبل\s+|منذ\s+)يومين", norm, re.I):
+        d = today - timedelta(days=2)
+        return "custom", d.isoformat(), d.isoformat()
+    if m:
+        d = today - timedelta(days=int(m.group(1)))
+        return "custom", d.isoformat(), d.isoformat()
+    if re.search(r"\b(?:امس|أمس|yesterday)\b", raw, re.I):
+        d = today - timedelta(days=1)
+        return "custom", d.isoformat(), d.isoformat()
+    if re.search(r"\b(?:اليوم|today)\b", norm, re.I):
+        return "custom", today.isoformat(), today.isoformat()
+
+    # Relative month ranges.
+    if re.search(r"(?:هذا\s+الشهر|الشهر\s+(?:الحالي|هذا)|this\s+month)", norm, re.I):
+        start = today.replace(day=1)
+        return "custom", start.isoformat(), today.isoformat()
+    if re.search(r"(?:الشهر\s+(?:الماضي|اللي\s+فات|الي\s+فات)|last\s+month)", norm, re.I):
+        first_this = today.replace(day=1)
+        last_prev = first_this - timedelta(days=1)
+        first_prev = last_prev.replace(day=1)
+        return "custom", first_prev.isoformat(), last_prev.isoformat()
+
+    # Last N days, inclusive of today.
+    last_days = re.search(r"(?:اخر|آخر|last)\s+(\d{1,3})\s*(?:يوم|ايام|أيام|days?)", norm, re.I)
+    if last_days:
+        count = max(1, int(last_days.group(1)))
+        start = today - timedelta(days=count - 1)
+        return "custom", start.isoformat(), today.isoformat()
+
+    # Explicit weekday range must be parsed before a single weekday.
+    range_match = re.search(
+        r"(?:من\s+)?(الاحد|الأحد|احد|أحد|الاثنين|الإثنين|اثنين|الثلاثاء|ثلاثاء|الاربعاء|الأربعاء|اربعاء|أربعاء|الخميس|خميس|الجمعه|الجمعة|جمعه|جمعة|السبت|سبت|sunday|monday|tuesday|wednesday|thursday|friday|saturday)\s*(?:الى|إلى|لل|ل|لين|حتى|to|-)\s*(الاحد|الأحد|احد|أحد|الاثنين|الإثنين|اثنين|الثلاثاء|ثلاثاء|الاربعاء|الأربعاء|اربعاء|أربعاء|الخميس|خميس|الجمعه|الجمعة|جمعه|جمعة|السبت|سبت|sunday|monday|tuesday|wednesday|thursday|friday|saturday)",
+        raw,
+        re.I,
+    )
+    if range_match:
+        def idx(word: str):
+            n = _normalize_for_semantic_guards(word)
+            for label, value in _WEEKDAY_INDEX.items():
+                if _normalize_for_semantic_guards(label) == n:
+                    return value
+            return None
+        i1, i2 = idx(range_match.group(1)), idx(range_match.group(2))
+        if i1 is not None and i2 is not None:
+            # Anchor on the current Sunday-based week. If the requested end is
+            # still in the future, use the previous week's matching range.
+            week_start_iso, _ = _attendance_week_bounds(today)
+            week_start = datetime.fromisoformat(week_start_iso).date()
+            # Convert Python weekday to offset from Sunday.
+            off1 = (i1 + 1) % 7
+            off2 = (i2 + 1) % 7
+            start = week_start + timedelta(days=off1)
+            end = week_start + timedelta(days=off2)
+            if end < start:
+                end += timedelta(days=7)
+            explicit_last_week = bool(re.search(
+                r"(?:الاسبوع|الأسبوع)\s+(?:الماضي|اللي\s+فات|الي\s+فات|اللي\s+راح|الي\s+راح)|last\s+week",
+                norm, re.I,
+            ))
+            if explicit_last_week or end > today:
+                start -= timedelta(days=7)
+                end -= timedelta(days=7)
+            return "custom", start.isoformat(), end.isoformat()
+
+    # Named weekday + "الماضي" is retrospective for attendance.
+    weekday = _attendance_named_weekday(raw)
+    if weekday:
+        return "custom", weekday, weekday
+
+    # Whole weeks.
+    if re.search(r"(?:الاسبوع|الأسبوع)\s+قبل\s+الماضي", raw, re.I):
+        current_start, _ = _attendance_week_bounds(today)
+        cs = datetime.fromisoformat(current_start).date()
+        start = cs - timedelta(days=14)
+        end = start + timedelta(days=4)
+        return "custom", start.isoformat(), end.isoformat()
+    if re.search(r"(?:قبل|منذ)\s+(?:اسبوعين|أسبوعين)", norm, re.I):
+        current_start, _ = _attendance_week_bounds(today)
+        cs = datetime.fromisoformat(current_start).date()
+        start = cs - timedelta(days=14)
+        end = start + timedelta(days=4)
+        return "custom", start.isoformat(), end.isoformat()
+
+    weeks_ago = re.search(r"(?:قبل|منذ)\s+(\d{1,2})\s*(?:اسبوع|أسبوع|اسابيع|أسابيع|weeks?)", norm, re.I)
+    if weeks_ago:
+        current_start, _ = _attendance_week_bounds(today)
+        cs = datetime.fromisoformat(current_start).date()
+        start = cs - timedelta(days=7 * int(weeks_ago.group(1)))
+        end = start + timedelta(days=4)
+        return "custom", start.isoformat(), end.isoformat()
+    if re.search(
+        r"(?:الاسبوع\s+(?:الماضي|اللي\s+راح|الي\s+راح|اللي\s+فات|الي\s+فات)|"
+        r"الأسبوع\s+(?:الماضي|اللي\s+راح|الي\s+راح|اللي\s+فات|الي\s+فات)|last\s+week)",
+        raw,
+        re.I,
+    ):
+        current_start, _ = _attendance_week_bounds(today)
+        cs = datetime.fromisoformat(current_start).date()
+        start = cs - timedelta(days=7)
+        end = start + timedelta(days=4)
+        return "custom", start.isoformat(), end.isoformat()
+    if re.search(r"(?:هذا\s+الاسبوع|هالاسبوع|الاسبوع\s+هذا|الأسبوع\s+هذا|الأسبوع\s+الحالي|الاسبوع\s+الحالي|this\s+week)", norm, re.I):
+        start, end = _attendance_week_bounds(today)
+        workweek_end = datetime.fromisoformat(end).date()
+        return "custom", start, min(today, workweek_end).isoformat()
+
+    # Same weekday one week ago.
+    if re.search(r"(?:قبل\s+اسبوع|قبل\s+أسبوع|من\s+اسبوع|من\s+أسبوع|a\s+week\s+ago)", raw, re.I):
+        d = today - timedelta(days=7)
+        return "custom", d.isoformat(), d.isoformat()
+
+    # Common work-week language.
+    if re.search(r"(?:اول\s+الاسبوع|أول\s+الأسبوع|بدايه\s+الاسبوع|بداية\s+الأسبوع|start\s+of\s+(?:the\s+)?week)", norm, re.I):
+        start, _ = _attendance_week_bounds(today)
+        return "custom", start, start
+    if re.search(r"(?:نهايه\s+الاسبوع|نهاية\s+الأسبوع|اخر\s+الاسبوع|آخر\s+الأسبوع|end\s+of\s+(?:the\s+)?week)", norm, re.I):
+        start, _ = _attendance_week_bounds(today)
+        s = datetime.fromisoformat(start).date()
+        # For RCRC attendance, Thursday is the last ordinary working day.
+        thursday = s + timedelta(days=4)
+        if thursday > today:
+            thursday -= timedelta(days=7)
+        return "custom", thursday.isoformat(), thursday.isoformat()
+
+    # Explicit numeric dates.
+    iso = re.search(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", raw)
+    if iso:
+        try:
+            d = datetime(int(iso.group(1)), int(iso.group(2)), int(iso.group(3))).date()
+            return "custom", d.isoformat(), d.isoformat()
+        except ValueError:
+            pass
+    dmy = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](20\d{2})\b", raw)
+    if dmy:
+        try:
+            d = datetime(int(dmy.group(3)), int(dmy.group(2)), int(dmy.group(1))).date()
+            return "custom", d.isoformat(), d.isoformat()
+        except ValueError:
+            pass
+
+    return "none", "", ""
+
+
 def _availability_period(message: str) -> tuple[str, str, str]:
     raw = _ascii_digits(str(message or ""))
     norm = _normalize_for_semantic_guards(raw)
+
+    named_relative = _explicit_named_weekday_period(raw)
+    if named_relative:
+        return named_relative
+
+    month_range = _extract_month_range(raw)
+    if month_range:
+        start_date, end_date = month_range
+        return "custom", start_date, end_date
+
+    retrospective_cue = bool(re.search(
+        r"(?:اول\s+امس|أول\s+أمس|قبل\s+أمس|قبل\s+امس|"
+        r"قبل\s+\d+\s*(?:يوم|ايام|أيام)|منذ\s+\d+\s*(?:يوم|ايام|أيام)|"
+        r"قبل\s+يومين|منذ\s+يومين|"
+        r"الشهر\s+(?:الماضي|اللي\s+فات|الي\s+فات)|last\s+month|"
+        r"الاسبوع\s+قبل\s+الماضي|الأسبوع\s+قبل\s+الماضي|"
+        r"قبل\s+(?:اسبوعين|أسبوعين)|منذ\s+(?:اسبوعين|أسبوعين)|"
+        r"قبل\s+\d+\s*(?:اسبوع|أسبوع|اسابيع|أسابيع)|"
+        r"منذ\s+\d+\s*(?:اسبوع|أسبوع|اسابيع|أسابيع)|"
+        r"اخر\s+\d+\s*(?:يوم|ايام|أيام)|آخر\s+\d+\s*(?:يوم|ايام|أيام)|"
+        r"day\s+before\s+yesterday|\d+\s+days?\s+ago|"
+        r"\d+\s+weeks?\s+ago)",
+        norm,
+        re.I,
+    ))
+    if retrospective_cue:
+        retro_period, retro_start, retro_end = _attendance_period(raw)
+        if retro_period != "none":
+            return retro_period, retro_start, retro_end
+
     if re.search(r"\b(?:بكره|بكرة|غدا|غداً|tomorrow)\b", norm, re.I):
         return "tomorrow", "", ""
     if re.search(r"\b(?:امس|أمس|yesterday)\b", raw, re.I):
@@ -1237,6 +1886,9 @@ def _availability_period(message: str) -> tuple[str, str, str]:
         return "this_week", "", ""
     if re.search(r"\b(?:اليوم|today)\b", norm, re.I):
         return "today", "", ""
+    weekday_date = _next_weekday_date(raw)
+    if weekday_date:
+        return "custom", weekday_date, weekday_date
     iso = re.search(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", raw)
     if iso:
         try:
@@ -1277,6 +1929,17 @@ def _clock_value(hour: str, minute: str | None, marker: str | None) -> str:
 
 def _extract_time_query(message: str) -> str:
     raw = _ascii_digits(str(message or ""))
+    norm = _normalize_for_semantic_guards(raw)
+    # Friendly calendar day-parts. These are ranges used only for filtering the
+    # signed-in employee's verified meeting list.
+    if re.search(r"(?:الصباح|صباح|صباحي|morning)", norm, re.I):
+        return "07:00-12:00"
+    if re.search(r"(?:بعد\s+الظهر|بعدالظهر|الظهر|العصر|afternoon)", norm, re.I):
+        return "12:00-17:00"
+    if re.search(r"(?:المساء|مساء|evening)", norm, re.I):
+        return "17:00-23:59"
+    if re.search(r"(?:اليوم\s+كامل|كامل\s+اليوم|كل\s+اليوم|اليوم\s+كله|full\s+day|all\s+day)", norm, re.I):
+        return "all-day"
     marker = r"(?:ص|م|صباح(?:ا|ًا)?|مساء(?:ا|ً)?|am|pm|a\.m\.|p\.m\.)?"
     range_re = re.compile(
         rf"(?:من\s+|from\s+)?(?:الساعة|الساعه|at)?\s*(\d{{1,2}})(?::(\d{{1,2}}))?\s*({marker})\s*"
@@ -1417,6 +2080,39 @@ def _availability_mode(message: str) -> str:
         return "busy"
     return "busy"
 
+def _extract_named_employee_contact_request(message: str) -> tuple[str, list[str]] | None:
+    """Extract a literal employee name plus requested contact fields."""
+    raw = " ".join(str(message or "").strip().split())
+    if not raw:
+        return None
+    fields: list[str] = []
+    if re.search(r"(?:ايميل|إيميل|البريد(?:\s+الإلكتروني)?|البريد(?:\s+الالكتروني)?|email)", raw, re.I):
+        fields.append("email")
+    if re.search(r"(?:رقم\s+(?:الجوال|جواله|الجواله|الموبايل|موبايله)?|جوال(?:ه|ها)?|موبايل(?:ه|ها)?|mobile|phone)", raw, re.I):
+        fields.append("mobile")
+    if re.search(r"(?:تحويل(?:ة|ه|ها|ته|تها)?|التحويلة|extension)", raw, re.I):
+        fields.append("extension")
+    if not fields:
+        return None
+    candidate = raw
+    candidate = re.sub(r"^(?:لو\s+سمحت\s+|ممكن\s+)?(?:(?:ابي|أبي|ابغى|أبغى|اريد|أريد|عطني|اعطني|أعطني|هات|وش|ماهو|ما\s+هو)\s+)+", "", candidate, flags=re.I).strip()
+    for pattern in [
+        r"(?:و\s*)?(?:ايميل|إيميل|البريد(?:\s+الإلكتروني)?|البريد(?:\s+الالكتروني)?|email)(?:ه|ها)?",
+        r"(?:و\s*)?رقم\s+(?:الجوال|جواله|الجواله|الموبايل|موبايله)?",
+        r"(?:و\s*)?(?:جوال(?:ه|ها)?|موبايل(?:ه|ها)?|mobile|phone)",
+        r"(?:و\s*)?(?:تحويل(?:ة|ه|ها|ته|تها)?|التحويلة|extension)",
+    ]:
+        candidate = re.sub(pattern, " ", candidate, flags=re.I)
+    candidate = re.sub(r"\b(?:حق|عن|الموظف|موظف|الشخص|شخص|باسم|اسم|اسمه)\b", " ", candidate, flags=re.I)
+    candidate = " ".join(candidate.strip(" ؟?!.،,؛;:").split())
+    if not candidate or candidate in {"ه", "ها", "هو", "هي", "له", "لها"}:
+        return None
+    blocked = {"ابي", "أبي", "ابغى", "أبغى", "ابحث", "أبحث", "إبحث", "دور", "دورلي", "ايميل", "إيميل", "جوال", "رقم"}
+    if any(token in blocked for token in candidate.split()):
+        return None
+    return candidate, fields
+
+
 def _repair_required_feature_grammar(
     request: ParsedRequest,
     message: str,
@@ -1436,7 +2132,12 @@ def _repair_required_feature_grammar(
     last_intent = str(last_request.get("intent") or "")
     followup_time = _extract_time_query(raw)
     explicit_period = bool(re.search(
-        r"\b(?:اليوم|بكره|بكرة|غدا|غداً|هذا\s+الاسبوع|هالاسبوع|today|tomorrow|this\s+week)\b|\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b|\b\d{1,2}[-/]\d{1,2}[-/]20\d{2}\b",
+        r"\b(?:اليوم|بكره|بكرة|غدا|غداً|هذا\s+الاسبوع|هالاسبوع|"
+        r"الاحد|الأحد|احد|أحد|الاثنين|الإثنين|اثنين|الثلاثاء|ثلاثاء|"
+        r"الاربعاء|الأربعاء|اربعاء|أربعاء|الخميس|خميس|"
+        r"الجمعه|الجمعة|جمعه|جمعة|السبت|سبت|"
+        r"today|tomorrow|this\s+week|sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b|"
+        r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b|\b\d{1,2}[-/]\d{1,2}[-/]20\d{2}\b",
         _ascii_digits(raw), re.I,
     ))
     explicit_availability_person = _extract_availability_person(raw)
@@ -1583,6 +2284,8 @@ def _repair_required_feature_grammar(
         return req
 
     # Tarasol transactions: explicit self vs another employee is security-significant.
+    # A broad "ابي معاملاتي بتراسل" starts with an overview/count. Details are
+    # fetched only when the user explicitly asks to show/list/view them.
     if re.search(r"(?:تراسل|معامل(?:تي|اتي|ه|ة|ات)?|المعامل(?:ه|ة|ات)?|transaction)", command_norm, re.I):
         if re.search(r"(?:مديري|المدير\s+حقي|my\s+manager)", command_norm, re.I):
             req.intent = "tarasol_details"
@@ -1593,7 +2296,14 @@ def _repair_required_feature_grammar(
             req.clarification_reason = ""
             req.confidence = 0.99
             return req
-        if re.search(r"(?:تفاصيل|معاملتي|معاملاتي|حقتي|حقي|عندي|my\s+transactions?|details)", command_norm, re.I):
+
+        explicit_details = bool(re.search(
+            r"(?:تفاصيل|اعرض|أعرض|ورني|ارني|أرني|هات|جيب|قائمه|قائمة|"
+            r"show|list|display|details?)",
+            command_norm,
+            re.I,
+        ))
+        if explicit_details:
             req.intent = "tarasol_details"
             req.operation = "details"
             req.targets = [TargetRef(kind="self", name="")]
@@ -1602,11 +2312,23 @@ def _repair_required_feature_grammar(
             req.clarification_reason = ""
             req.confidence = 0.99
             return req
+
         if re.search(r"(?:كم|عدد|count|how\s+many)", command_norm, re.I):
             req.intent = "tarasol_count"
             req.operation = "lookup"
             req.targets = [TargetRef(kind="self", name="")]
             req.fields = ["count"]
+            req.query = "tarasol:self_count"
+            req.clarification_reason = ""
+            req.confidence = 0.99
+            return req
+
+        if re.search(r"(?:معاملتي|معاملاتي|حقتي|حقي|عندي|my\s+transactions?)", command_norm, re.I):
+            req.intent = "tarasol_count"
+            req.operation = "lookup"
+            req.targets = [TargetRef(kind="self", name="")]
+            req.fields = ["count"]
+            req.query = "tarasol:self_overview"
             req.clarification_reason = ""
             req.confidence = 0.99
             return req
@@ -1712,7 +2434,7 @@ def _repair_required_feature_grammar(
         req.confidence = 0.99
         return req
 
-    if re.search(r"(?:اخر|آخر|احدث|أحدث|جديد|latest|recent)", command_raw, re.I) and re.search(r"(?:اخبار|أخبار|news)", command_raw, re.I):
+    if re.search(r"(?:اخر|آخر|احدث|أحدث|ابرز|أبرز|اهم|أهم|جديد|latest|recent|top|highlights?)", command_raw, re.I) and re.search(r"(?:اخبار|أخبار|news)", command_raw, re.I):
         req.intent = "news"
         req.operation = "list"
         req.targets = []
@@ -2067,7 +2789,7 @@ def _repair_required_feature_grammar(
     # beat any stale employee calendar context, e.g. after asking about the
     # manager: "لا اجتماعاتي مو مديري".
     own_calendar_correction = bool(re.search(
-        r"(?:اجتماعاتي|مواعيدي|جدول\s+اجتماعاتي|ميتنقاتي|my\s+meetings|my\s+calendar|my\s+schedule)",
+        r"(?:اجتماعاتي|مواعيدي|جدول\s+(?:اجتماعاتي|اجتماعتي)|ميتنقاتي|my\s+meetings|my\s+calendar|my\s+schedule)",
         raw, re.I,
     )) and bool(re.search(r"(?:^|\s)(?:لا|مو\s+مديري|مش\s+مديري|not\s+my\s+manager)(?:\s|$)", raw, re.I))
     if own_calendar_correction:
@@ -2117,7 +2839,7 @@ def _repair_required_feature_grammar(
         req.period = period if period in {"today", "tomorrow", "yesterday", "this_week", "last_week", "custom"} else "today"
         req.start_date = start_date
         req.end_date = end_date
-        req.time_query = followup_time or str(last_request.get("time_query") or "")
+        req.time_query = followup_time
         req.query = ""
         req.clarification_reason = ""
         req.confidence = max(float(req.confidence or 0.0), 0.99)
@@ -2125,7 +2847,7 @@ def _repair_required_feature_grammar(
 
     # Short attendance-period follow-ups stay in attendance, not calendar.
     if last_intent in {"attendance_today", "attendance_history", "working_hours"} and explicit_period and not explicit_availability_person:
-        period, start_date, end_date = _availability_period(raw)
+        period, start_date, end_date = _attendance_period(raw)
         req.intent = "working_hours" if last_intent == "working_hours" else ("attendance_today" if period == "today" else "attendance_history")
         req.operation = "lookup"
         req.targets = [TargetRef(kind="self", name="")]
@@ -2422,7 +3144,11 @@ def _repair_required_feature_grammar(
     # Own meetings: deterministic because this route is frequently demoed and
     # must not depend on an LLM parse. Own calendar may show meeting subjects.
     own_meeting_cue = bool(re.search(
-        r"(?:اجتماعاتي|مواعيدي|جدولي|جدول\s+اجتماعاتي|ميتنقاتي|my\s+meetings|my\s+calendar|my\s+schedule)",
+        r"(?:اجتماعاتي|مواعيدي|جدولي|جدول\s+(?:اجتماعاتي|اجتماعتي)|ميتنقاتي|"
+        r"اجتماعات\s+(?:يوم\s+)?(?:الاحد|الأحد|احد|أحد|الاثنين|الإثنين|اثنين|الثلاثاء|ثلاثاء|"
+        r"الاربعاء|الأربعاء|اربعاء|أربعاء|الخميس|خميس|الجمعه|الجمعة|جمعه|جمعة|السبت|سبت)|"
+        r"my\s+meetings|my\s+calendar|my\s+schedule|"
+        r"(?:upcoming\s+)?meetings\s+(?:on\s+)?(?:sunday|monday|tuesday|wednesday|thursday|friday|saturday))",
         raw, re.I,
     ))
     if own_meeting_cue:
@@ -2446,7 +3172,7 @@ def _repair_required_feature_grammar(
         raw,
         re.I,
     ))
-    own_meetings = bool(re.search(r"\b(?:اجتماعاتي|مواعيدي|جدولي|جدول\s+اجتماعاتي|my\s+meetings|my\s+calendar|my\s+schedule)\b", raw, re.I))
+    own_meetings = bool(re.search(r"\b(?:اجتماعاتي|مواعيدي|جدولي|جدول\s+(?:اجتماعاتي|اجتماعتي)|my\s+meetings|my\s+calendar|my\s+schedule)\b", raw, re.I))
     if availability_cue and not own_meetings:
         person = _extract_availability_person(raw)
         target: TargetRef | None = None
@@ -2492,6 +3218,45 @@ def _repair_required_feature_grammar(
         req.confidence = max(float(req.confidence or 0.0), 0.99)
         return req
 
+    # Bare profile-field follow-up for the currently verified employee.
+    # Example: after selecting "الأول", "ابي تحويلة" means that employee's
+    # extension; it is not a new employee search.
+    if has_focus:
+        bare = re.sub(
+            r"^(?:(?:ابي|أبي|ابغى|أبغى|اعطني|عطني|هات|ممكن|وش|ايش)\s+)+",
+            "",
+            raw,
+            flags=re.I,
+        ).strip()
+        bare_norm = _normalize_for_semantic_guards(bare)
+        bare_field_map = {
+            "ايميل": "email",
+            "البريد": "email",
+            "البريد الالكتروني": "email",
+            "جوال": "mobile",
+            "الجوال": "mobile",
+            "رقم الجوال": "mobile",
+            "رقم جوال": "mobile",
+            "تحويله": "extension",
+            "تحويلة": "extension",
+            "التحويله": "extension",
+            "التحويلة": "extension",
+            "المسمى": "job_title",
+            "المسمى الوظيفي": "job_title",
+            "الاداره": "department",
+            "الادارة": "department",
+        }
+        field = bare_field_map.get(bare_norm)
+        if field:
+            req.intent = "employee_details"
+            req.operation = "details"
+            req.targets = [TargetRef(kind="focus", name="")]
+            req.fields = [field]
+            req.query = "employee:focus_field"
+            req.clarification_reason = ""
+            req.confidence = max(float(req.confidence or 0.0), 0.99)
+            return req
+
     explicit_detail_patterns = (
         (r"^(?:ابي|ابغى|اعطني|عطني|وش|ايش|ما)?\s*(?:ايميل|إيميل|بريد)\s+(.+)$", "email"),
         (r"^(?:ابي|ابغى|اعطني|عطني|وش|ايش|ما)?\s*(?:جوال|موبايل|رقم\s+(?:الجوال|جوال|الموبايل|موبايل|الهاتف|هاتف)|رقم\s+التواصل)\s+(.+)$", "mobile"),
@@ -2501,7 +3266,9 @@ def _repair_required_feature_grammar(
     for pattern, field in explicit_detail_patterns:
         match = re.match(pattern, raw, flags=re.I)
         if match:
-            person_text = re.sub(r"[؟?!.،,]+$", "", str(match.group(1) or "")).strip()
+            person_text = _strip_discourse_prefix(
+                re.sub(r"[؟?!.،,]+$", "", str(match.group(1) or "")).strip()
+            )
             if person_text and not _looks_like_organizational_role(person_text):
                 req.intent = "employee_details"
                 req.operation = "details"
@@ -2822,6 +3589,46 @@ def _repair_required_feature_grammar(
         req.confidence = max(float(req.confidence or 0.0), 0.99)
         return req
 
+    # If the immediately preceding employee search returned exactly one verified
+    # employee, possessive follow-ups such as "ايوا ابي ايميله ورقم جواله"
+    # refer to that employee even if an older manager is still the current focus.
+    requested_contact_fields: list[str] = []
+    if re.search(r"(?:ايميل(?:ه|ها|ة)?|إيميل(?:ه|ها|ة)?|ايميله|ايميلة|إيميله|إيميلة|بريد(?:ه|ها)?|email)", raw, re.I):
+        requested_contact_fields.append("email")
+    if re.search(r"(?:جوال(?:ه|ها)?|موبايل(?:ه|ها)?|رقم\s+(?:جوال(?:ه|ها)?|موبايل(?:ه|ها)?)|رقم\s+جواله|رقم\s+جوالها|mobile|phone)", raw, re.I):
+        requested_contact_fields.append("mobile")
+    if re.search(r"(?:تحويل(?:ته|تها|ه|ها)?|extension)", raw, re.I):
+        requested_contact_fields.append("extension")
+
+    list_ctx_for_contact = (
+        state.get("list_state")
+        if isinstance(state, dict) and isinstance(state.get("list_state"), dict)
+        else {}
+    )
+    if (
+        requested_contact_fields
+        and _is_anaphoric_reference(message)
+        and str(list_ctx_for_contact.get("intent") or "") == "employee_search"
+    ):
+        one_rows = [x for x in (list_ctx_for_contact.get("items") or []) if isinstance(x, dict)]
+        if len(one_rows) == 1:
+            selected = one_rows[0]
+            selected_name = str(
+                selected.get("name_ar")
+                or selected.get("name")
+                or selected.get("name_en")
+                or ""
+            ).strip()
+            if selected_name:
+                req.intent = "employee_details"
+                req.operation = "details"
+                req.targets = [TargetRef(kind="employee", name=selected_name)]
+                req.fields = list(dict.fromkeys(requested_contact_fields))
+                req.query = "employee:single_search_followup"
+                req.clarification_reason = ""
+                req.confidence = max(float(req.confidence or 0.0), 0.99)
+                return req
+
     # Plain possessive profile/contact follow-up after a verified person focus.
     # Collect every requested field, e.g. "ابي ايميله ورقم جواله".
     if has_focus:
@@ -3071,7 +3878,7 @@ class SemanticParser:
         for attempt in range(self.retries):
             raw = ""
             try:
-                response = await asyncio.to_thread(chat, messages)
+                response = await asyncio.to_thread(semantic_chat, messages)
                 raw = str(_message_content(response) or "")
                 parsed = _extract_json(raw)
                 if not isinstance(parsed, dict):
@@ -3118,6 +3925,40 @@ class SemanticParser:
 
         Authorization and API execution remain backend-owned.
         """
+
+        original_message = str(message or "")
+        message = _normalize_intent_input(original_message)
+        if message != original_message.strip():
+            print(
+                f"[Intent Normalizer] {original_message!r} -> {message!r}",
+                file=sys.stderr,
+            )
+
+        # v185: explicit self-profile fields and explicit numbered content-detail
+        # nouns are closed grammar. They must not be reinterpreted by Qwen or
+        # stale list_state/focus. Examples:
+        #   "ابي ايميلي وتحويلتي" -> profile:self
+        #   "ابي تفاصيل اول ميزه" -> mazaya_details, even after a news list
+        direct_seed = ParsedRequest(
+            intent="general", operation="chat", targets=[], fields=[],
+            query="", role_query="", department_query="", period="none",
+            start_date="", end_date="", ordinal=0, relation_depth=1,
+            amount=None, time_query="", confidence=0.0, clarification_reason="",
+        )
+        direct_req = _repair_required_feature_grammar(direct_seed, message, state)
+        if (
+            direct_req.intent == "profile"
+            and any(t.kind == "self" for t in (direct_req.targets or []))
+            and str(direct_req.query or "").startswith("profile:")
+        ):
+            print(f"[Direct Self Profile Route] {direct_req.model_dump()}", file=sys.stderr)
+            return self._clean_request(direct_req)
+
+        if direct_req.intent in {
+            "news_details", "announcement_details", "mazaya_details", "policy_details"
+        } and direct_req.ordinal > 0:
+            print(f"[Direct Content Detail Route] {direct_req.model_dump()}", file=sys.stderr)
+            return self._clean_request(direct_req)
         payload = {
             "CURRENT_MESSAGE": str(message or "").strip(),
             "LANGUAGE": language,

@@ -9,6 +9,7 @@ import traceback
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from dotenv import load_dotenv
 from typing import Any, Callable, TextIO
 
 try:
@@ -113,6 +114,12 @@ class _TeeStream:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._original, name)
 
+
+
+# Load backend environment variables for SQL feedback.
+# override=False preserves real process/environment values in production.
+_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(dotenv_path=_ENV_FILE, override=False)
 
 class ObservabilityStore:
     """Production-safe structured observability.

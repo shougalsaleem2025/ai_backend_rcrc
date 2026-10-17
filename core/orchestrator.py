@@ -9,9 +9,14 @@ import operator
 import re
 import secrets
 import sys
+from datetime import datetime, timezone, timedelta
 from copy import deepcopy
 from typing import Any
 
+from core.leave_overlap_response import render_leave_overlap
+from core.overlap_dates import parse_overlap_dates
+from core.response_quality import polish_response
+from core.date_dialogue import date_year_turn, dated_message_needs_year
 from core.config import settings
 from core.conversation_memory import ConversationMemory
 from core.employee_api import (
@@ -32,6 +37,7 @@ from core.reference_resolver import ReferenceResolver, restore_pending_selection
 from core.semantic_models import ParsedRequest, ResolvedTarget, TargetRef
 from core.request_validator import validate_request
 from core.response_renderer import (
+    FRIENDLY_RENDERER_BUILD,
     render_attendance,
     render_availability,
     render_content_list,
@@ -51,7 +57,17 @@ from core.response_renderer import (
     render_tarasol_count,
     summarize_verified,
 )
-from core.semantic_parser import SEMANTIC_PARSER_BUILD, SemanticParser, detect_language, _extract_leave_amount, _person_slot_target
+from core.semantic_parser import (
+    SEMANTIC_PARSER_BUILD,
+    SemanticParser,
+    detect_language,
+    _extract_leave_amount,
+    _person_slot_target,
+    _extract_time_query,
+    _availability_period,
+    _attendance_period,
+    _has_explicit_period_cue,
+)
 from core.intent_map import DETAIL_BASE_INTENT, get_policy
 from core.directory_queries import DirectoryQueryService, bounded_employee as directory_employee, employee_name as directory_employee_name
 from core.authorization import AuthorizationService
@@ -68,7 +84,7 @@ from core.general_guard import (
 )
 
 
-ORCHESTRATOR_BUILD = "rcrc-v163-context-api-routing-fixes-2026-10-03"
+ORCHESTRATOR_BUILD = "rcrc-v248-selection-language-fix-2026-10-15"
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +178,23 @@ def _strip_conversation_fillers(value: str) -> str:
     return text
 
 
+def _arabic_gender_salutation(profile: dict[str, Any]) -> str:
+    """Return أبشر/أبشري from verified employee profile only."""
+    raw = " ".join(
+        str(profile.get(key) or "")
+        for key in ("gender_ar", "gender_en", "genderAr", "genderEn", "gender")
+    ).strip().casefold()
+
+    if not raw:
+        return ""
+
+    if raw in {"أنثى", "انثى", "female", "woman", "f"} or "أنثى" in raw or "انثى" in raw or "female" in raw:
+        return "أبشري"
+    if raw in {"ذكر", "male", "man", "m"} or "ذكر" in raw or "male" in raw:
+        return "أبشر"
+    return ""
+
+
 def _assistant_identity_reply(message: str, language: str) -> str | None:
     normalized = _strip_conversation_fillers(message)
 
@@ -178,14 +211,13 @@ def _assistant_identity_reply(message: str, language: str) -> str | None:
     if normalized in assistant_ar or normalized.casefold() in assistant_en:
         if language == "ar":
             return (
-                "أنا RCRC.AI، مساعدك الذكي في الهيئة 😊 "
+                "أنا سند 😊 "
                 "أساعدك في معلومات الموظفين، الإجازات، الحضور، الاجتماعات، تراسل، "
-                "المزايا، الأخبار والسياسات. وأنا حاليًا في مرحلتي التجريبية وقاعد أتطور باستمرار."
+                "المزايا، الأخبار والسياسات."
             )
         return (
-            "I'm RCRC.AI, your AI assistant at RCRC 😊 I can help with employee information, "
-            "leave, attendance, meetings, Tarasol, benefits, news, and policies. "
-            "I'm currently in my experimental phase and continuously improving."
+            "I'm Sanad 😊 I can help with employee information, "
+            "leave, attendance, meetings, Tarasol, benefits, news, and policies."
         )
     return None
 
@@ -221,9 +253,11 @@ def _assistant_capabilities_reply(message: str, language: str) -> str | None:
 # الحين الافتراضي هو الـ API، والموديل العام فقط للمجاملة والكتابة الصريحة.
 # ===========================================================================
 def _obvious_general_conversation(message: str, state: dict[str, Any]) -> bool:
-    """Shortcut to the no-tools general model ONLY for clear small talk or
-    explicit writing/advice requests. Everything else goes through the
-    enterprise router/parser. A short message is NOT a reason to skip the API."""
+    """Fast-path detector for obvious small talk or explicit writing/advice.
+
+    This helper is intentionally conservative. The semantic parser is the primary
+    authority for open-ended general knowledge, technical explanations, coding,
+    drafting, translation, and other normal assistant questions."""
     raw = " ".join(str(message or "").strip().split())
     if not raw:
         return False
@@ -600,9 +634,9 @@ def _render_reporting_rows(rows: list[dict[str, Any]], language: str, *, subject
     if not rows:
         if language == "ar":
             return (
-                "ما يظهر في النظام موظفين تابعين لك مباشرة."
+                "حاليًا ما عندك موظفين تابعين لك مباشرة 👥😊"
                 if self_subject
-                else f"ما يظهر في النظام موظفين تابعين لـ {subject_name} مباشرة."
+                else f"حاليًا ما يظهر موظفين تابعين مباشرة لـ {subject_name} 👥😊"
             )
         return (
             "The system doesn't show any employees reporting directly to you."
@@ -611,9 +645,9 @@ def _render_reporting_rows(rows: list[dict[str, Any]], language: str, *, subject
         )
     if language == "ar":
         header = (
-            f"الموظفين اللي تحتك مباشرة ({len(rows)}):"
+            f"أكيد 👥 هذولا الموظفين التابعين لك مباشرة ({len(rows)}):"
             if self_subject
-            else f"الموظفين اللي تحت {subject_name} مباشرة ({len(rows)}):"
+            else f"أكيد 👥 هذولا الموظفين التابعين مباشرة لـ {subject_name} ({len(rows)}):"
         )
     else:
         header = (
@@ -631,6 +665,254 @@ def _render_reporting_rows(rows: list[dict[str, Any]], language: str, *, subject
     return "\n".join(lines)
 
 
+def _contextual_reply_kind(message: str) -> str:
+    """
+    Classify a short conversational reply to a pending assistant offer.
+
+    This is intentionally meaning-based rather than an exact sentence matcher:
+    a pending action should survive natural acknowledgements such as
+    "ايوا", "تمام ورني", "أوكي يلا", "sure", or "go ahead".
+
+    Returns: "affirmative", "negative", or "".
+    """
+    raw = str(message or "").strip()
+    if not raw:
+        return ""
+
+    norm = _norm_role_text(raw)
+    words = [w for w in re.split(r"\s+", norm) if w]
+
+    # Long/structured messages are treated as a new user request, not a reply
+    # to the previous offer.
+    if len(words) > 5 or len(norm) > 45:
+        return ""
+
+    negative = bool(re.search(
+        r"(?:^|\s)(?:لا|لأ|مو\s+لازم|مش\s+لازم|خلاص|الغ|الغي|"
+        r"no|nope|cancel|never\s*mind)(?:$|\s)",
+        norm,
+        re.I,
+    ))
+    if negative:
+        return "negative"
+
+    # A real new question/topic should not be swallowed by the pending offer.
+    topic_change = bool(re.search(
+        r"(?:\?|؟|مين|متى|وين|وش|ايش|كيف|كم|ليش|"
+        r"اجتماع|موظف|مدير|اجاز|إجاز|حضور|دوام|سياس|خبر|اعلان|إعلان|مزايا|"
+        r"who|when|where|what|how|why|meeting|employee|manager|leave|"
+        r"attendance|policy|news|announcement|benefit)",
+        norm,
+        re.I,
+    ))
+    if topic_change and not re.search(
+        r"(?:ورني|اعرض|أعرض|طلع|طلّع|show|go\s+ahead)",
+        norm,
+        re.I,
+    ):
+        return ""
+
+    affirmative_signal = bool(re.search(
+        r"(?:ايوا|ايوه|ايه|إيوا|أيوه|إيه|نعم|تمام|اوكي|أوكي|اوك|"
+        r"اكيد|أكيد|يلا|ورني|اعرض(?:ها|هم)?|أعرض(?:ها|هم)?|"
+        r"طلعها|طلّعها|yes|yeah|yep|sure|okay|ok|show(?:\s+me|\s+them)?|go\s+ahead)",
+        norm,
+        re.I,
+    ))
+    if affirmative_signal:
+        return "affirmative"
+
+    # When سند has just asked an explicit yes/no continuation question,
+    # a very short non-question reply is normally conversational acceptance.
+    # This avoids requiring a phrase dictionary for every dialect variant.
+    if len(words) <= 2 and not topic_change:
+        return "affirmative"
+
+    return ""
+
+
+def _context_engine_followup(
+    message: str,
+    state: dict[str, Any],
+) -> ParsedRequest | None:
+    """
+    Resolve an elliptical follow-up from structural conversation context.
+
+    This intentionally handles *modifiers*, not new topics. Examples:
+      meetings -> "طيب الخميس الماضي؟"
+      attendance -> "الثلاثاء؟"
+      Tawasul events -> "طيب أمس"
+      vacation history -> "الشهر الماضي"
+
+    A message containing a new enterprise noun is left to the semantic parser.
+    """
+    raw = " ".join(str(message or "").strip().split())
+    if not raw:
+        return None
+
+    norm = raw.casefold().translate(str.maketrans({
+        "أ": "ا", "إ": "ا", "آ": "ا", "ى": "ي", "ة": "ه", "ؤ": "و", "ئ": "ي",
+    }))
+    norm = re.sub(r"[؟?!.،,]+$", "", norm).strip()
+    norm = re.sub(
+        r"^(?:(?:طيب|طب|تمام|اوكي|اوك|حلو|ممتاز|ماشي|يعني|"
+        r"then|okay|ok|and)\s+)+",
+        "",
+        norm,
+        flags=re.I,
+    ).strip()
+
+    last = state.get("last_request") if isinstance(state.get("last_request"), dict) else {}
+    ctx = state.get("conversation_context") if isinstance(state.get("conversation_context"), dict) else {}
+    if not last:
+        return None
+
+    last_intent = str(last.get("intent") or ctx.get("active_domain") or "")
+    if last_intent in {"", "general", "web_search", "summarize_previous"}:
+        return None
+
+    # A clear new domain noun means this is a new request, not an elliptical
+    # modifier. Date/time words are deliberately absent from this guard.
+    new_topic = bool(re.search(
+        r"(?:موظف|موظفين|مدير|اداره|ادارة|سياس|خبر|اخبار|إعلان|اعلان|"
+        r"مزايا|معامل|تراسل|رصيد|اجاز|إجاز|حضور|دوام|اجتماع|ميتنج|"
+        r"employee|manager|department|policy|news|announcement|benefit|"
+        r"transaction|leave|attendance|meeting)",
+        norm,
+        re.I,
+    ))
+
+    # If the message only names/modifies a date/time, inherit the domain.
+    has_period = _has_explicit_period_cue(raw)
+    selected_time = _extract_time_query(raw)
+
+    modifier_only = bool(
+        has_period
+        or selected_time
+        or re.fullmatch(
+            r"(?:اليوم|امس|أمس|بكره|بكرة|غدا|غداً|"
+            r"الاحد|الأحد|الاثنين|الإثنين|الثلاثاء|الاربعاء|الأربعاء|"
+            r"الخميس|الجمعه|الجمعة|السبت|"
+            r"الصباح|صباح|الظهر|ظهر|العصر|عصر|المساء|مساء|الليل|ليل|"
+            r"today|yesterday|tomorrow|"
+            r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+            r"morning|afternoon|evening|tonight)",
+            norm,
+            re.I,
+        )
+    )
+
+    # Explicit new-topic nouns normally win. The only exception is when the
+    # noun merely repeats the currently active domain ("اجتماعات الخميس").
+    active_domain_nouns = {
+        "meetings": r"(?:اجتماع|اجتماعات|ميتنج|meeting)",
+        "meeting_list": r"(?:اجتماع|اجتماعات|ميتنج|meeting)",
+        "attendance_today": r"(?:حضور|دوام|attendance)",
+        "attendance_history": r"(?:حضور|دوام|attendance)",
+        "working_hours": r"(?:حضور|دوام|ساعات|attendance|working)",
+        "vacation_history": r"(?:اجاز|إجاز|vacation|leave)",
+    }
+    if new_topic:
+        own = active_domain_nouns.get(last_intent, "")
+        if not own or not re.search(own, norm, re.I):
+            return None
+
+    if not modifier_only:
+        return None
+
+    try:
+        restored = ParsedRequest.model_validate(last)
+    except Exception:
+        return None
+
+    if has_period:
+        try:
+            if last_intent in {"attendance_today", "attendance_history", "working_hours"}:
+                period, start_date, end_date = _attendance_period(raw)
+                if last_intent in {"attendance_today", "attendance_history"}:
+                    restored.intent = "attendance_today" if period == "today" else "attendance_history"
+            else:
+                period, start_date, end_date = _availability_period(raw)
+
+            restored.period = period
+            restored.start_date = start_date
+            restored.end_date = end_date
+        except Exception:
+            return None
+
+    if selected_time:
+        restored.time_query = selected_time
+
+    # Preserve the active sub-view, e.g. meetings:tawasul.
+    active_view = str(ctx.get("active_view") or last.get("query") or "")
+    if active_view:
+        restored.query = active_view
+
+    restored.clarification_reason = ""
+    restored.confidence = 1.0
+    return restored
+
+
+def _list_selection_index(message: str) -> int | None:
+    """
+    Resolve a user choice from the last displayed numbered list.
+    Supports:
+      "1", "رقم 1", "الأول", "الثاني", ... "العاشر"
+    """
+    raw = " ".join(str(message or "").strip().split())
+    if not raw:
+        return None
+
+    # Arabic/English digits.
+    arabic_digits = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+    norm = raw.translate(arabic_digits).strip().casefold()
+
+    m = re.fullmatch(r"(?:رقم\s*)?(\d{1,3})", norm)
+    if m:
+        value = int(m.group(1))
+        return value - 1 if value >= 1 else None
+
+    ordinal_map = {
+        "الاول": 0, "الأول": 0, "اول": 0, "أول": 0,
+        "الثاني": 1, "ثاني": 1,
+        "الثالث": 2, "ثالث": 2,
+        "الرابع": 3, "رابع": 3,
+        "الخامس": 4, "خامس": 4,
+        "السادس": 5, "سادس": 5,
+        "السابع": 6, "سابع": 6,
+        "الثامن": 7, "ثامن": 7,
+        "التاسع": 8, "تاسع": 8,
+        "العاشر": 9, "عاشر": 9,
+        "first": 0, "second": 1, "third": 2, "fourth": 3, "fifth": 4,
+        "sixth": 5, "seventh": 6, "eighth": 7, "ninth": 8, "tenth": 9,
+    }
+    return ordinal_map.get(norm)
+
+
+def _employee_name_from_row(row: dict[str, Any]) -> str:
+    return str(
+        row.get("name_ar")
+        or row.get("name")
+        or row.get("name_en")
+        or row.get("employeeName")
+        or row.get("employee_name")
+        or ""
+    ).strip()
+
+
+def _employee_username_from_row(row: dict[str, Any]) -> str:
+    return str(
+        row.get("username")
+        or row.get("userName")
+        or row.get("user_name")
+        or row.get("employeeUsername")
+        or row.get("employee_username")
+        or row.get("userid")
+        or row.get("userId")
+        or ""
+    ).strip()
+
+
 def _critical_orchestrator_preflight(message: str, state: dict[str, Any], language: str) -> ParsedRequest | None:
     """Second safety boundary for critical follow-ups before Qwen.
 
@@ -638,7 +920,97 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
     self references, gender-count mode, unique selection from the last verified
     search list, and focus-only availability/date follow-ups.
     """
+    def make(**kwargs: Any) -> ParsedRequest:
+        base = dict(
+            intent="general", operation="chat", targets=[], fields=[], query="",
+            role_query="", department_query="", period="none", start_date="",
+            end_date="", ordinal=0, relation_depth=1, amount=None, time_query="",
+            confidence=0.99, clarification_reason="",
+        )
+        base.update(kwargs)
+        return ParsedRequest(**base)
+
+
     raw = " ".join(str(message or "").strip().split())
+
+    # v243: numbered selection from the last displayed employee list.
+    list_state = state.get("list_state") if isinstance(state.get("list_state"), dict) else {}
+    if (str(list_state.get("kind") or "") == "department_employees" or str(list_state.get("intent") or "") == "general_department_members"):
+        selected_index = _list_selection_index(raw)
+        items = list_state.get("items") if isinstance(list_state.get("items"), list) else []
+
+        if selected_index is not None and 0 <= selected_index < len(items):
+            selected_row = items[selected_index] if isinstance(items[selected_index], dict) else {}
+            selected_name = _employee_name_from_row(selected_row)
+            selected_username = _employee_username_from_row(selected_row)
+
+            # Set the selected employee as the current focus.
+            focus_state = state.setdefault("focus", {})
+            previous_current = (
+                focus_state.get("current")
+                if isinstance(focus_state.get("current"), dict)
+                else {}
+            )
+            if previous_current:
+                focus_state["previous"] = previous_current
+
+            selected_focus = dict(selected_row)
+            selected_focus.update({
+                "username": selected_username,
+                "name": selected_name,
+                "source": "department_list_selection",
+            })
+            focus_state["current"] = selected_focus
+
+            # Keep list_state for a later different numeric choice, but route
+            # this turn directly to verified employee details.
+            print(
+                f"[List Selection] index={selected_index + 1} "
+                f"name={selected_name!r} username={selected_username!r}",
+                file=sys.stderr,
+            )
+
+            # A numbered choice is a REQUEST FOR FULL DETAILS, not an ACK.
+            # Preserve the exact displayed row and verified employee code.
+            selected_code = str(
+                selected_row.get("emp_code")
+                or selected_row.get("userCode")
+                or selected_row.get("empCode")
+                or selected_row.get("employeeCode")
+                or ""
+            ).strip()
+            selected_focus["emp_code"] = selected_code
+            focus_state["current"] = selected_focus
+            state["selected_list_employee"] = {
+                "name": selected_name,
+                "username": selected_username,
+                "emp_code": selected_code,
+                "index": selected_index + 1,
+            }
+            # Route through authorization, target resolution and real API
+            # retrieval. Never claim full details from a brief list row.
+            return make(
+                intent="employee_details",
+                operation="details",
+                targets=[TargetRef(kind="focus", name="")],
+                fields=["name", "job_title", "department", "email", "mobile", "extension"],
+                query="employee:selected_from_department_list",
+                confidence=1.0,
+            )
+
+        # A numeric choice outside the current list should not silently map
+        # to a different person.
+        if selected_index is not None and items:
+            return make(
+                intent="general",
+                operation="chat",
+                targets=[],
+                fields=[],
+                query="general:list_selection_out_of_range",
+                confidence=1.0,
+                clarification_reason="list_selection_out_of_range",
+            )
+
     norm = raw.casefold()
     norm = norm.translate(str.maketrans({"أ":"ا","إ":"ا","آ":"ا","ى":"ي","ة":"ه","ؤ":"و","ئ":"ي"}))
     norm = (
@@ -650,6 +1022,40 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
     norm = re.sub(r"[؟?!.،,]+$", "", norm).strip()
     norm = re.sub(r"^[\-–—•]+\s*", "", norm).strip()
     raw = re.sub(r"^[\-–—•]+\s*", "", raw).strip()
+
+    # INTEGRATED FIX: an explicit what-if leave balance question cannot route
+    # to attendance because of the ambiguous Arabic word "يوم".
+    # Uses existing verified leave balance and NEVER submits a leave request.
+    leave_signal = bool(re.search(r"(?:اجاز|إجاز|leave|vacation|time\s+off|days?\s+off)", norm, re.I))
+    remain_signal = bool(re.search(r"(?:كم\s+(?:يبق|باق)|يبق|يتبق|باقي|المتبقي|remaining|how\s+many.*left|\bleft\b)", norm, re.I))
+    take_signal = bool(re.search(r"(?:خذت|اخذت|اخذ|باخذ|ناخذ|خصمت|استخدمت|لو|اذا|if\s+i\s+take|take)", norm, re.I))
+    leave_ctx = state.get("leave_context") if isinstance(state.get("leave_context"), dict) else {}
+    last_request_ctx = state.get("last_request") if isinstance(state.get("last_request"), dict) else {}
+    prior_leave = bool(leave_ctx.get("displayed_balance") is not None or last_request_ctx.get("intent") == "leave_balance")
+    # Short follow-ups such as "طيب لو يوم" keep the *current* leave calculation.
+    # A previous leave balance in storage alone is not enough: the latest
+    # request must still belong to leave_balance to prevent cross-topic leakage.
+    short_leave_followup = bool(re.fullmatch(
+        r"(?:طيب\s*)?(?:لو|اذا|if)\s*(?:يوم|يومين|\d+\s*(?:يوم|ايام|days?|day)|one\s+day|two\s+days?)\s*(?:كم\s*(?:يبقى|باقي|يتبقى))?",
+        norm.strip(), re.I,
+    ))
+    active_leave = str(last_request_ctx.get("intent") or "") == "leave_balance"
+    if (remain_signal and take_signal and (leave_signal or prior_leave)) or (short_leave_followup and active_leave and prior_leave):
+        amount_match = re.search(r"(?<!\d)([0-9٠-٩]+(?:\.[0-9]+)?)\s*(?:يوم|ايام|أيام|day|days)", norm, re.I)
+        amount = None
+        if amount_match:
+            amount = float(amount_match.group(1).translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")))
+        elif re.search(r"(?:يومين|يومَين|two\s+days?|two\s+days?\s+off)", norm, re.I):
+            amount = 2.0
+        elif re.search(r"(?:ثلاث\s*ايام|ثلاثة\s*أيام|three\s+days?)", norm, re.I):
+            amount = 3.0
+        elif re.search(r"(?:\bيوم\b|\bday\b|one\s+day)", norm, re.I):
+            amount = 1.0
+        if amount is not None and amount > 0:
+            return make(intent="leave_balance", operation="calculate",
+                        targets=[TargetRef(kind="self", name="")],
+                        fields=["balance"], amount=amount,
+                        query="leave:self_hypothetical", confidence=1.0)
 
     # RCRC-FIX-v136: narrow department acronym normalization.
     # Supports natural mixed-language wording without changing any API routing:
@@ -677,15 +1083,21 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
     norm = re.sub(r"\biwant\b", "i want", norm, flags=re.I)
     norm = re.sub(r"\bmanger\b", "manager", norm, flags=re.I)
 
-    def make(**kwargs: Any) -> ParsedRequest:
-        base = dict(
-            intent="general", operation="chat", targets=[], fields=[], query="",
-            role_query="", department_query="", period="none", start_date="",
-            end_date="", ordinal=0, relation_depth=1, amount=None, time_query="",
-            confidence=0.99, clarification_reason="",
-        )
-        base.update(kwargs)
-        return ParsedRequest(**base)
+
+    # A negation corrects the requested field, not the referenced person.
+    # Never treat "لا" / "no" as an employee name.
+    if re.fullmatch(
+        r"(?:لا|مو|no)[\s،,]+(?:ابي\s+|ابغى\s+)?(?:رقم\s+)?(?:جواله|جوالها|الجوال|جوال|موبايله|mobile|mobile number)",
+        norm, re.I,
+    ):
+        current = (state.get("focus") or {}).get("current") or {}
+        if _uid(current):
+            return make(
+                intent="employee_details", operation="details",
+                targets=[TargetRef(kind="focus", name="")],
+                fields=["mobile"], query="employee:correction_mobile",
+                confidence=1.0,
+            )
 
     pending_now = state.get("pending") if isinstance(state.get("pending"), dict) else {}
     if (
@@ -702,12 +1114,307 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
         except Exception:
             pass
 
+    # If سند just offered the selected employee's job title/department,
+    # a natural "اي / نعم / yes" continues with that same verified focus.
+    if (
+        str(pending_now.get("kind") or "") == "employee_more_details"
+        and norm in {"اي", "ايوه", "أيوه", "نعم", "يب", "yes", "yeah", "yep"}
+    ):
+        return make(
+            intent="employee_details",
+            operation="details",
+            targets=[TargetRef(kind="focus", name="")],
+            fields=["job_title", "department"],
+            query="employee:focus_more_details",
+            confidence=1.0,
+        )
+
+    # Bare contact/work-field follow-ups belong to the currently verified
+    # employee focus. This prevents phrases like "ابي تحويلة" from drifting to
+    # an older person or being interpreted as a new employee name.
+    focus_state = state.get("focus") if isinstance(state.get("focus"), dict) else {}
+    focus_current = focus_state.get("current") if isinstance(focus_state.get("current"), dict) else {}
+    has_verified_focus = bool(_uid(focus_current))
+    if has_verified_focus:
+        bare_field_text = re.sub(
+            r"^(?:(?:ابي|أبي|ابغى|أبغى|عطني|اعطني|هات|ممكن|وش|ايش|what(?:'s| is)?|show me|give me)\s+)+",
+            "",
+            norm,
+            flags=re.I,
+        ).strip()
+        bare_field_map = {
+            "ايميل": "email", "إيميل": "email", "البريد": "email", "البريد الالكتروني": "email",
+            "جوال": "mobile", "الجوال": "mobile", "رقم الجوال": "mobile", "رقم جوال": "mobile",
+            "تحويله": "extension", "تحويلة": "extension", "التحويله": "extension", "التحويلة": "extension",
+            "المسمى": "job_title", "المسمى الوظيفي": "job_title", "مسمى وظيفي": "job_title",
+            "الاداره": "department", "الادارة": "department", "إدارته": "department", "ادارته": "department",
+            "email": "email", "mobile": "mobile", "phone": "mobile", "extension": "extension",
+            "job title": "job_title", "department": "department",
+        }
+        bare_field = bare_field_map.get(bare_field_text)
+        if bare_field:
+            return make(
+                intent="employee_details",
+                operation="details",
+                targets=[TargetRef(kind="focus", name="")],
+                fields=[bare_field],
+                query="employee:focus_field",
+                confidence=1.0,
+            )
+
+    if re.fullmatch(
+        r"(?:تستعبط|تستهبل|تستسعبط|غبي|غبيه|غباء|يا\s+غبي|يا\s+غبيه|"
+        r"are\s+you\s+kidding|stupid)",
+        norm,
+        re.I,
+    ):
+        return make(
+            intent="general",
+            operation="chat",
+            targets=[],
+            fields=[],
+            query="general:frustration",
+            confidence=1.0,
+        )
+
+    # Contextual self-meeting continuation. A short time-window reply must
+    # preserve the day/date that was selected on the previous turn. Pending is
+    # the primary source; meeting_context is a structural fallback so a state
+    # cleanup cannot silently reset "Tuesday morning" back to today.
+    pending = state.get("pending") if isinstance(state.get("pending"), dict) else {}
+    pending_kind = str(pending.get("kind") or "")
+    meeting_context = state.get("meeting_context") if isinstance(state.get("meeting_context"), dict) else {}
+    selected_time = _extract_time_query(raw)
+
+    if pending_kind == "meeting_time_window" or (
+        selected_time
+        and str(meeting_context.get("subject_kind") or "") == "self"
+        and str(meeting_context.get("mode") or "").startswith("self_meetings")
+    ):
+        raw_req = pending.get("request") if isinstance(pending.get("request"), dict) else {}
+        try:
+            if raw_req:
+                restored = ParsedRequest.model_validate(raw_req)
+            else:
+                restored = ParsedRequest.model_validate({
+                    "intent": "meetings",
+                    "operation": "list",
+                    "targets": [{"kind": "self", "name": ""}],
+                    "fields": [
+                        "subject", "start_time", "end_time", "location",
+                        "organizer_name", "my_response", "teams_link",
+                    ],
+                    "query": "meetings:self",
+                    "role_query": "",
+                    "department_query": "",
+                    "period": str(meeting_context.get("period") or "none"),
+                    "start_date": str(meeting_context.get("start_date") or ""),
+                    "end_date": str(meeting_context.get("end_date") or ""),
+                    "ordinal": 0,
+                    "relation_depth": 1,
+                    "amount": None,
+                    "time_query": str(meeting_context.get("time_query") or ""),
+                    "confidence": 1.0,
+                    "clarification_reason": "",
+                })
+
+            # The same reply may explicitly change the day/date.
+            if _has_explicit_period_cue(raw):
+                period, start_date, end_date = _availability_period(raw)
+                restored.period = period
+                restored.start_date = start_date
+                restored.end_date = end_date
+
+            if selected_time:
+                restored.time_query = selected_time
+
+            if selected_time or _has_explicit_period_cue(raw):
+                restored.clarification_reason = ""
+                restored.confidence = 1.0
+                return restored
+        except Exception:
+            pass
+
+    # Follow-up after سند mentions hidden Tawasul events/invitations.
+    # A short "اي / نعم / ورني" means "show those Tawasul items" and must not
+    # drift into generic chat.
+    pending = state.get("pending") if isinstance(state.get("pending"), dict) else {}
+    if str(pending.get("kind") or "") == "tawasul_events_offer":
+        raw_req = pending.get("request") if isinstance(pending.get("request"), dict) else {}
+        reply_kind = _contextual_reply_kind(raw)
+
+        if reply_kind == "affirmative" and raw_req:
+            try:
+                restored = ParsedRequest.model_validate(raw_req)
+                restored.query = "meetings:tawasul"
+                restored.clarification_reason = ""
+                restored.confidence = 1.0
+
+                # Natural contextual refinement:
+                # "اي، أمس" / "تمام بكرة" / "ورني اليوم" keeps the same
+                # Tawasul intent while changing only the requested date.
+                if _has_explicit_period_cue(raw):
+                    try:
+                        period, start_date, end_date = _availability_period(raw)
+                        restored.period = period
+                        restored.start_date = start_date
+                        restored.end_date = end_date
+                    except Exception:
+                        pass
+
+                print(
+                    f"[Context Continuation] pending='tawasul_events_offer' "
+                    f"text={raw!r} -> meetings:tawasul period={restored.period!r}",
+                    file=sys.stderr,
+                )
+                print(
+                    "[Context Continuation] reusing same MeetingList request scope; "
+                    "tool cache should HIT while TTL is active",
+                    file=sys.stderr,
+                )
+                return restored
+            except Exception as exc:
+                print(f"[Context Continuation Error] {exc}", file=sys.stderr)
+
+        if reply_kind == "negative":
+            _clear_pending(state)
+            return make(
+                intent="general", operation="chat", targets=[], fields=[],
+                query="general:acknowledgement", confidence=1.0,
+            )
+
+    # Follow-up to a meeting result. When سند explicitly asks whether to check
+    # the next time window, a natural yes/no reply must continue that same
+    # meeting request instead of becoming generic chat.
+    # Follow-up after سند offers to show a department employee list.
+    pending = state.get("pending") if isinstance(state.get("pending"), dict) else {}
+    if str(pending.get("kind") or "") == "department_members_offer":
+        raw_req = pending.get("request") if isinstance(pending.get("request"), dict) else {}
+        reply_kind = _contextual_reply_kind(raw)
+
+        if reply_kind == "affirmative" and raw_req:
+            try:
+                restored = ParsedRequest.model_validate(raw_req)
+                _clear_pending(state)
+                print(
+                    f"[Context Continuation] pending='department_members_offer' "
+                    f"text={raw!r} -> department:members",
+                    file=sys.stderr,
+                )
+                return restored
+            except Exception as exc:
+                print(f"[Department Context Continuation Error] {exc}", file=sys.stderr)
+
+        if reply_kind == "negative":
+            _clear_pending(state)
+            return make(
+                intent="general",
+                operation="chat",
+                targets=[],
+                fields=[],
+                query="general:acknowledgement",
+                confidence=1.0,
+            )
+
+    # Follow-up after سند offers to show Tarasol transaction details.
+    # This is context-based: "اي / ايوا / ورني / اعرضها" means execute the
+    # exact offer that سند just made, not a generic chat response.
+    pending = state.get("pending") if isinstance(state.get("pending"), dict) else {}
+    if str(pending.get("kind") or "") == "tarasol_details_offer":
+        raw_req = pending.get("request") if isinstance(pending.get("request"), dict) else {}
+        reply_kind = _contextual_reply_kind(raw)
+
+        if reply_kind == "affirmative" and raw_req:
+            try:
+                restored = ParsedRequest.model_validate(raw_req)
+                restored.intent = "tarasol_details"
+                restored.operation = "details"
+                restored.targets = [TargetRef(kind="self", name="")]
+                restored.fields = ["all"]
+                restored.query = "tarasol:self_details"
+                restored.clarification_reason = ""
+                restored.confidence = 1.0
+                _clear_pending(state)
+                print(
+                    f"[Context Continuation] pending='tarasol_details_offer' "
+                    f"text={raw!r} -> tarasol:self_details",
+                    file=sys.stderr,
+                )
+                return restored
+            except Exception as exc:
+                print(f"[Tarasol Context Continuation Error] {exc}", file=sys.stderr)
+
+        if reply_kind == "negative":
+            _clear_pending(state)
+            return make(
+                intent="general",
+                operation="chat",
+                targets=[],
+                fields=[],
+                query="general:acknowledgement",
+                confidence=1.0,
+            )
+
+    pending = state.get("pending") if isinstance(state.get("pending"), dict) else {}
+    if str(pending.get("kind") or "") == "meeting_followup_window":
+        raw_req = pending.get("request") if isinstance(pending.get("request"), dict) else {}
+        affirmative = bool(re.fullmatch(
+            r"(?:اي|إي|ايوه|أيوه|ايه|إيه|نعم|yes|yeah|yep|تمام|اوكي|أوكي)",
+            norm, re.I,
+        ))
+        negative = bool(re.fullmatch(
+            r"(?:لا|لأ|no|nope|خلاص|مو لازم|مش لازم)",
+            norm, re.I,
+        ))
+        if affirmative and raw_req:
+            try:
+                restored = ParsedRequest.model_validate(raw_req)
+                restored.clarification_reason = ""
+                restored.confidence = 1.0
+                return restored
+            except Exception:
+                pass
+        if negative:
+            return make(
+                intent="general", operation="chat", targets=[], fields=[],
+                query="general:acknowledgement", confidence=1.0,
+            )
+
     # RCRC-FIX-v121: finish a previous date-range clarification using a short
     # period-only reply such as "الشهر الماضي" without forcing the user to
     # repeat the original leave/vacation request.
     pending = state.get("pending") if isinstance(state.get("pending"), dict) else {}
     if str(pending.get("kind") or "") == "missing_date_range":
         raw_req = pending.get("request") if isinstance(pending.get("request"), dict) else {}
+
+        # v178: month/date follow-ups must complete the ORIGINAL enterprise
+        # request deterministically. Examples after "ابي جدول حضوري":
+        #   "ابي شهر اوقست", "اغسطس الحالي", "شهر 8", "August 2026".
+        # Do not send these short replies back to Qwen, where they can drift to
+        # a generic calendar question. The semantic date resolver is already
+        # authoritative for these closed date expressions.
+        if raw_req and _has_explicit_period_cue(raw):
+            try:
+                restored = ParsedRequest.model_validate(raw_req)
+                if restored.intent in {"attendance_today", "attendance_history", "working_hours"}:
+                    selected_period, selected_start, selected_end = _attendance_period(raw)
+                else:
+                    selected_period, selected_start, selected_end = _availability_period(raw)
+                if restored.intent in {"attendance_today", "attendance_history"}:
+                    restored.intent = "attendance_today" if selected_period == "today" else "attendance_history"
+                    restored.operation = "lookup"
+                    restored.targets = [TargetRef(kind="self", name="")]
+                    restored.fields = ["all"]
+                    restored.query = str(restored.query or "attendance:summary")
+                restored.period = selected_period
+                restored.start_date = selected_start
+                restored.end_date = selected_end
+                restored.clarification_reason = ""
+                restored.confidence = 1.0
+                return restored
+            except Exception:
+                pass
+
         period_map = (
             ("today", r"^(?:اليوم|today)$"),
             ("tomorrow", r"^(?:بكره|بكرة|غدا|غداً|tomorrow)$"),
@@ -733,6 +1440,20 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
                 return restored
             except Exception:
                 pass
+
+    # v232: generic structural follow-up inheritance.
+    contextual_request = _context_engine_followup(raw, state)
+    if contextual_request is not None:
+        print(
+            f"[Context Engine] text={raw!r} -> "
+            f"intent={contextual_request.intent!r} "
+            f"period={contextual_request.period!r} "
+            f"start={contextual_request.start_date!r} "
+            f"end={contextual_request.end_date!r} "
+            f"query={contextual_request.query!r}",
+            file=sys.stderr,
+        )
+        return contextual_request
 
     # RCRC-FIX-v118: HR-letter read-only routing must be resolved before
     # canonical rewriting. Phrases such as "لمن أقدر أوجه خطاب الموارد البشرية؟"
@@ -765,6 +1486,82 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
                 targets=[], fields=[], query="hr_letter:recipients",
             )
 
+    # v188: first-person possessive contact/profile requests are FINAL self-profile
+    # grammar and must be resolved before the generic explicit-named-contact rule.
+    # Without this guard, Arabic possessive endings such as "ايميلي" / "جوالي"
+    # can be stripped down to stray letters (e.g. "ي ي") and then misread as a
+    # person name by the older contact fallback.
+    self_contact_fields: list[str] = []
+    for field_name, pattern in (
+        ("email", r"(?:ايميلي|إيميلي|ايميل\s*ي|بريدي(?:\s+الالكتروني)?|my\s+email)"),
+        ("mobile", r"(?:رقم\s+جوالي|جوالي|رقم\s+موبايلي|موبايلي|my\s+(?:mobile|phone)(?:\s+number)?)"),
+        ("extension", r"(?:تحويلتي|رقم\s+تحويلتي|my\s+extension)"),
+        ("job_title", r"(?:مسماي|منصبي|مسمى\s+وظيفتي|my\s+(?:job\s+)?title)"),
+        ("department", r"(?:ادارتي|إدارتي|الاداره\s+حقتي|الإدارة\s+حقتي|my\s+department)"),
+        ("username", r"(?:يوزري|اسم\s+المستخدم\s+حقي|my\s+username)"),
+    ):
+        if re.search(pattern, norm, re.I) and field_name not in self_contact_fields:
+            self_contact_fields.append(field_name)
+    if self_contact_fields:
+        return make(
+            intent="profile", operation="details",
+            targets=[TargetRef(kind="self", name="")],
+            fields=self_contact_fields, query="profile:self_fields",
+        )
+
+    # Explicit named contact request with one or more fields.
+    # Current-turn employee name always wins over self/focus context.
+    # Examples:
+    #   "ابي ايميل ورقم جوال اوس الدعجان"
+    #   "عطني ايميل ماجد السلطان"
+    explicit_contact_fields: list[str] = []
+    if re.search(r"(?:ايميل|إيميل|ايمميل|بريد(?:\s+الكتروني)?|email)", norm, re.I):
+        explicit_contact_fields.append("email")
+    if re.search(r"(?:رقم\s+(?:جوال|موبايل)|جوال|موبايل|phone|mobile)", norm, re.I):
+        explicit_contact_fields.append("mobile")
+    if re.search(r"(?:تحويل|تحويله|تحويلة|extension)", norm, re.I):
+        explicit_contact_fields.append("extension")
+
+    if explicit_contact_fields:
+        explicit_person = norm
+        explicit_person = re.sub(
+            r"^(?:(?:تمام|طيب|ايوا|ايوه|ايه|إيه|اوكي|أوكي|okay|ok)\s+)*(?:(?:ابي|أبي|ابغى|أبغى|اريد|أريد|عطني|اعطني|أعطني|هات|ممكن|please|give\s+me)\s+)+",
+            "",
+            explicit_person,
+            flags=re.I,
+        ).strip()
+        # Remove the COMPLETE requested field phrase, including Arabic
+        # possessive suffixes.  The old pattern removed only the stem
+        # (e.g. "ايميل" from "ايميله") and left a stray "ه" behind.
+        # That residue was then misread as an explicit employee name ("ه ه")
+        # and overrode an already verified conversational focus.
+        explicit_person = re.sub(
+            r"(?:ايميل(?:ه|ها|ة)?|إيميل(?:ه|ها|ة)?|ايمميل(?:ه|ها|ة)?|"
+            r"بريد(?:ه|ها)?(?:\s+الكتروني)?|email(?:\s+address)?|"
+            r"رقم\s+(?:جوال|موبايل)(?:ه|ها)?|"
+            r"(?:جوال|موبايل)(?:ه|ها)?|phone(?:\s+number)?|mobile(?:\s+number)?|"
+            r"تحويلت(?:ه|ها)|تحويل(?:ه|ها|ة)?|extension)",
+            " ",
+            explicit_person,
+            flags=re.I,
+        )
+        explicit_person = re.sub(r"(?:^|\s)(?:و|and|&)(?=\s|$)", " ", explicit_person, flags=re.I)
+        explicit_person = " ".join(explicit_person.split()).strip(" ؟?!.,،")
+
+        # A real current-turn name beats any old conversational focus.
+        if (
+            explicit_person
+            and bool(explicit_person.split())
+            and explicit_person not in {"انا", "أنا", "مديري", "مديره", "مديرها", "ي", "لي", "حقي"}
+        ):
+            return make(
+                intent="employee_details",
+                operation="details",
+                targets=[TargetRef(kind="employee", name=explicit_person)],
+                fields=list(dict.fromkeys(explicit_contact_fields)),
+                query="employee:explicit_named_contact",
+            )
+
     named_contact = re.fullmatch(
         r"(?:(?:ابي|ابغى|اريد|عطني|اعطني|هات|ممكن)\s+)?"
         r"(?P<field>ايميل|إيميل|بريد(?:\s+الكتروني)?|جوال|موبايل|رقم\s+(?:جوال|موبايل)|email|mobile|phone)"
@@ -782,7 +1579,14 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
                 fields=[field], query="employee:explicit_contact",
             )
 
-    if re.search(r"(?:رصيد\s+(?:اجازتي|إجازتي)|كم\s+رصيد\s+(?:اجازتي|إجازتي)|my\s+(?:leave|vacation)\s+balance)", norm, re.I):
+    if re.search(
+        r"(?:رصيد\s+(?:اجازتي|إجازتي|اجازاتي|إجازاتي)|"
+        r"كم\s+رصيد\s+(?:اجازتي|إجازتي|اجازاتي|إجازاتي)|"
+        r"(?:رصيد|كم)\s+.*(?:اجازاتي|إجازاتي)|"
+        r"my\s+(?:leave|vacation)\s+balance)",
+        norm,
+        re.I,
+    ):
         return make(
             intent="leave_balance", operation="lookup",
             targets=[TargetRef(kind="self", name="")],
@@ -843,8 +1647,8 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
         # availability flow below.
         self_meeting = bool(
             re.search(
-                r"(?:اجتماعاتي|اجتماعي|مواعيدي|جدولي|"
-                r"جدول\s+اجتماعاتي|قائمه\s+اجتماعاتي|قائمة\s+اجتماعاتي|"
+                r"(?:اجتماعاتي|اجتماعتي|اجتماعي|مواعيدي|جدولي|"
+                r"جدول\s+(?:اجتماعاتي|اجتماعتي)|قائمه\s+(?:اجتماعاتي|اجتماعتي)|قائمة\s+(?:اجتماعاتي|اجتماعتي)|"
                 r"مواعيد\s+اجتماعاتي|my\s+(?:meetings?|calendar|schedule))",
                 norm, re.I,
             )
@@ -855,19 +1659,26 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
             )
         )
         if self_meeting:
-            period = ""
-            if re.search(r"(?:بكره|بكرة|غدا|غداً|tomorrow)", norm, re.I):
-                period = "tomorrow"
-            elif re.search(r"(?:اليوم|today)", norm, re.I):
-                period = "today"
-            elif re.search(r"(?:الاسبوع\s+(?:هذا|الحالي)|this\s+week)", norm, re.I):
-                period = "this_week"
+            # Resolve dates and weekdays deterministically. This lets natural
+            # wording such as "جدول اجتماعاتي الثلاثاء" map to the actual next
+            # Tuesday date instead of falling through to the LLM.
+            if _has_explicit_period_cue(raw):
+                period, start_date, end_date = _availability_period(raw)
+            else:
+                period, start_date, end_date = "none", "", ""
+
+            time_query = _extract_time_query(raw)
+
             return make(
                 intent="meetings", operation="list",
                 targets=[TargetRef(kind="self", name="")],
-                fields=["subject", "start_time", "end_time"],
-                period=period or "none", query="meetings:self",
-                clarification_reason="" if period else "missing_date_range",
+                fields=[
+                    "subject", "start_time", "end_time", "location",
+                    "organizer_name", "my_response", "teams_link",
+                ],
+                period=period, start_date=start_date, end_date=end_date,
+                time_query=time_query, query="meetings:self",
+                clarification_reason="" if period != "none" else "missing_date_range",
             )
 
     # RCRC-FIX-v120: deterministic routing for enterprise requests that Qwen
@@ -905,18 +1716,30 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
                 clarification_reason="missing_date_range",
             )
 
-        # Explicit overlap/intersection request also requires a user-selected
-        # date range. The deployed endpoint currently returns 404, but we still
-        # collect the correct request before reporting service unavailability.
+        # A full overlap range is authoritative: do not ask for dates again.
         if re.search(
             r"(?:متداخل|متداخله|متقاط|تعارض|تقاطع|overlap|intersect|conflict)",
             norm, re.I,
         ):
+            overlap_start, overlap_end, overlap_issue = parse_overlap_dates(raw)
+            if not overlap_issue:
+                overlap_period = "custom"
+            elif overlap_issue == "missing_range" and _has_explicit_period_cue(raw):
+                overlap_period, overlap_start, overlap_end = _availability_period(raw)
+                # Month-only without year is ambiguous for leave overlap.
+                if re.search(r"(?:\b20\d{2}\b)", raw) is None and overlap_period == "custom":
+                    overlap_issue = "missing_year"
+                else:
+                    overlap_issue = ""
             return make(
                 intent="leave_overlap", operation="lookup",
                 targets=[TargetRef(kind="self", name="")],
-                fields=["all"], period="none", query="leave:self_overlap",
-                clarification_reason="missing_date_range",
+                fields=["all"], period="custom" if not overlap_issue and overlap_start else "none",
+                start_date=overlap_start, end_date=overlap_end,
+                query="leave:self_overlap",
+                clarification_reason="" if not overlap_issue else (
+                    "missing_year" if overlap_issue == "missing_year" else "missing_date_range"
+                ),
             )
 
         # "قائمة الإجازات" means the organisation-visible vacation list,
@@ -934,7 +1757,13 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
     # Team attendance
     # ------------------------------------------------------------------
     if (
-        re.search(r"(?:حضور|دوام|attendance)", norm, re.I)
+        re.search(
+            r"(?:حضور|دوام|تأخير|تاخير|أوفر\s*تايم|اوفر\s*تايم|"
+            r"ساعات\s+إضافية|ساعات\s+اضافية|نقص|فرق\s+الساعات|"
+            r"إجازة|اجازة|نوع\s+اليوم|بصم|attendance|lateness|late|"
+            r"overtime|extra\s+hours|off\s+day|weekend|leave|vacation)",
+            norm, re.I,
+        )
         and re.search(
             r"(?:الموظفين\s+(?:التابعين|اللي\s+يتبعون|اللي\s+تحتي)|موظفيني|فريقي|"
             r"team|direct\s+reports?|reporting\s+employees)",
@@ -948,10 +1777,27 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
             period = "yesterday"
         elif re.search(r"(?:هذا\s+الاسبوع|الاسبوع\s+(?:هذا|الحالي)|this\s+week)", norm, re.I):
             period = "this_week"
+        if re.search(r"(?:تاخير|تأخير|متأخر|lateness|late|delay)", norm, re.I):
+            team_mode = "attendance:lateness"
+        elif re.search(r"(?:اوفر\s*تايم|أوفر\s*تايم|ساعات\s+(?:اضافية|إضافية)|overtime|extra\s+hours)", norm, re.I):
+            team_mode = "attendance:overtime"
+        elif re.search(r"(?:ناقص|نقص|فرق\s+(?:الدوام|الساعات)|difference|shortfall)", norm, re.I):
+            team_mode = "attendance:difference"
+        elif re.search(r"(?:الساعات\s+(?:المطلوبه|المطلوبة|الرسمية)|regular\s+hours|required\s+hours)", norm, re.I):
+            team_mode = "attendance:regular_hours"
+        elif re.search(r"(?:اجازه|اجازة|إجازة|اوف\s*داي|أوف\s*داي|off\s+day|weekend|نوع\s+اليوم|يوم\s+دوام)", norm, re.I):
+            team_mode = "attendance:day_type"
+        elif re.search(r"(?:بصم|بصمة|fingerprint|punch)", norm, re.I):
+            team_mode = "attendance:punch_status"
+        elif re.search(r"(?:كم\s+ساع|مدة\s+الدوام|ساعات\s+الدوام|working\s+hours|how\s+long)", norm, re.I):
+            team_mode = "attendance:working_hours"
+        else:
+            team_mode = "attendance:summary"
+
         return make(
             intent="team_attendance", operation="list",
             targets=[TargetRef(kind="self", name="")],
-            fields=["all"], period=period or "none", query="attendance:team",
+            fields=["all"], period=period or "none", query=team_mode,
             clarification_reason="" if period else "missing_date_range",
         )
 
@@ -1072,6 +1918,42 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
     if all_units_list:
         return make(intent="general_department_counts", operation="list", fields=["name", "count"], query="org_units:list")
 
+    # Centralized routing for explicit organization questions. Runs before the
+    # generic person-name and department-list fallbacks. Actual membership is
+    # always checked by the verified directory backend.
+    from core.directory_intent import route_department_message
+    org_request = route_department_message(raw)
+    if org_request is not None:
+        if org_request.action == "manager":
+            # Job-role lookup is not the same as listing department employees.
+            # Do not invent a manager from a matching staff list.
+            return make(
+                intent="employee_role_search", operation="search",
+                role_query=f"مدير {org_request.department}",
+                fields=["name", "job_title", "department"],
+                query="org:manager_role_search",
+            )
+        if org_request.action == "members":
+            return make(
+                intent="general_department_members", operation="list",
+                department_query=org_request.department,
+                fields=["name", "job_title"], query="department:members",
+            )
+        if org_request.action == "count":
+            return make(
+                intent="general_department_counts", operation="calculate",
+                department_query=org_request.department,
+                fields=["count"], query="department:count",
+            )
+        if org_request.action == "units":
+            # Our directory's employee department labels do not prove an org
+            # hierarchy. Ask for a verified organization chart rather than
+            # presenting employee names as child departments.
+            return make(
+                intent="general", operation="chat",
+                query="general:org_hierarchy_unverified",
+            )
+
     # RCRC-FIX-v136: explicit job-title questions must be role searches, not
     # department-member queries or employee-name searches.
     #
@@ -1129,6 +2011,99 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
             query="role:explicit",
         )
 
+    # HARD CONTENT FIREWALL: full-detail content phrases are never employee names.
+    # This also protects conversations that started before selected content was
+    # persisted in list_state. If no exact selected item exists yet, the detail
+    # executor will ask for the item number within the SAME content domain.
+    _content_full_cue = bool(re.search(
+        r"(?:التفاصيل\s+(?:كامله|كاملة)(?:\s+(?:للخبر|للاعلان|للإعلان|للميزه|للميزة|للسياسه|للسياسة))?|"
+        r"كامل\s+التفاصيل|كل\s+التفاصيل|التفاصيل\s+بالكامل|"
+        r"الخبر\s+كامل|كامل\s+الخبر|الاعلان\s+كامل|الإعلان\s+كامل|"
+        r"كامل\s+الاعلان|كامل\s+الإعلان|full\s+details?|full\s+article)",
+        norm, re.I,
+    ))
+    if _content_full_cue:
+        _ls = state.get("list_state") if isinstance(state.get("list_state"), dict) else {}
+        _base_to_detail = {
+            "news": "news_details",
+            "announcements": "announcement_details",
+            "mazaya": "mazaya_details",
+            "policy_search": "policy_details",
+        }
+        _detail_intent = str(_ls.get("selected_detail_intent") or "")
+        if _detail_intent not in DETAIL_BASE_INTENT:
+            # Explicit noun in CURRENT_MESSAGE wins; otherwise inherit list domain.
+            if re.search(r"(?:خبر|اخبار|أخبار|news|article)", norm, re.I):
+                _detail_intent = "news_details"
+            elif re.search(r"(?:اعلان|إعلان|announcement)", norm, re.I):
+                _detail_intent = "announcement_details"
+            elif re.search(r"(?:ميزه|ميزة|مزايا|عرض|benefit|offer)", norm, re.I):
+                _detail_intent = "mazaya_details"
+            elif re.search(r"(?:سياسه|سياسة|policy|procedure)", norm, re.I):
+                _detail_intent = "policy_details"
+            else:
+                _detail_intent = _base_to_detail.get(str(_ls.get("intent") or ""), "")
+        if _detail_intent in DETAIL_BASE_INTENT:
+            return make(
+                intent=_detail_intent, operation="details", targets=[], fields=["all"],
+                ordinal=0, query="content:full",
+            )
+
+    # Direct employee contact/profile requests bypass the unreliable general LLM route.
+    # Do not match service requests such as leave/attendance/meetings.
+    from core.direct_employee_intent import direct_employee_lookup
+    direct_lookup = direct_employee_lookup(raw)
+    if direct_lookup:
+        mode, person_query, wanted_fields = direct_lookup
+        if mode == "email_lookup":
+            return make(intent="employee_search", operation="search", fields=wanted_fields,
+                        query=person_query, confidence=1.0)
+        return make(intent="employee_details", operation="details",
+                    targets=[TargetRef(kind="employee", name=person_query)],
+                    fields=wanted_fields, query="employee:direct_lookup", confidence=1.0)
+
+    # Explicit employee-name search. Keep this narrow so policies/news/content
+    # searches are not mistaken for people-directory searches.
+    employee_search_match = re.fullmatch(
+        r"(?:(?:طيب|طب|تمام|اوكي|أوكي|اوك|حلو|ممكن|بس)\s+)*"
+        r"(?:(?:ابي|أبي|ابغى|أبغى)\s+)?"
+        r"(?:ابحث|أبحث|دور|دوّر|دورلي|دور\s+لي|find|search)"
+        r"(?:\s+لي)?\s+(?:عن|على|for)?\s*(.+)",
+        norm,
+        re.I,
+    )
+    if employee_search_match:
+        employee_query = str(employee_search_match.group(1) or "").strip(" ؟?!.,،")
+        blocked_domains = bool(re.search(
+            r"(?:سياسه|سياسة|خبر|اخبار|أخبار|اعلان|إعلان|مزايا|مزايا|"
+            r"policy|news|announcement|mazaya)",
+            employee_query,
+            re.I,
+        ))
+        plural_directory = bool(re.search(
+            r"(?:موظفين|الموظفين|الموظفات|employees|staff)",
+            employee_query,
+            re.I,
+        ))
+        if employee_query and not blocked_domains and not plural_directory:
+            focus_state = state.setdefault("focus", {})
+            previous_current = focus_state.get("current") if isinstance(focus_state.get("current"), dict) else {}
+            if previous_current:
+                focus_state["previous"] = previous_current
+            focus_state["current"] = {}
+            _clear_pending(state)
+            print(
+                f"[Explicit Employee Search] query={employee_query!r} cleared_old_focus=True",
+                file=sys.stderr,
+            )
+            return make(
+                intent="employee_search",
+                operation="search",
+                targets=[],
+                fields=["name", "job_title", "department"],
+                query=employee_query,
+            )
+
     alias_map = {
         "it": "التقنية والرقمنة",
         "ict": "التقنية والرقمنة",
@@ -1142,25 +2117,89 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
         if re.search(rf"(?:^|\s){re.escape(alias)}(?:$|\s)", norm, re.I):
             dept_query = canonical
             break
+    if not dept_query and re.search(
+        r"(?:التقنيه|التقنية)\s*(?:و|وال)?\s*(?:الرقمنه|الرقمنة)|"
+        r"(?:technology|digitalization|digitization)",
+        norm,
+        re.I,
+    ):
+        dept_query = "التقنية والرقمنة"
+
     if not dept_query:
-        m_dep = re.search(r"((?:ال)?اداره(?:\s+(?:ال)?عامه)?\s+[^؟?!.،,]+)", norm, re.I)
+        m_dep = re.search(
+            r"((?:ال)?(?:اداره|ادارة|إدارة|ادراة)(?:\s+(?:ال)?(?:عامه|عامة))?\s+[^؟?!.،,]+)",
+            norm,
+            re.I,
+        )
         if m_dep:
             dept_query = str(m_dep.group(1) or "").strip()
-    # RCRC-FIX-v4: "كم عدد الموظفين في إدارة X" is a count, not a list.
-    if re.search(r"(?:موظف|موظفين|موظفي|موظفو|employees?|staff)", norm, re.I) and dept_query and re.search(r"(?:كم|عدد|اجمالي|how\s+many|count)", norm, re.I):
-        names_too = bool(re.search(r"(?:اسماء|اسامي|اسمائهم|names)", norm, re.I))
+    # Natural directory-list wording, including common spelling variants:
+    # "قائمة موظفين إدارة التقنية", "موظفي ادراة التقنية", "staff in IT".
+    department_member_cue = bool(re.search(
+        r"(?:موظف|موظفين|موظفي|موظفو|الموظفين|الموظفات|employees?|staff)",
+        norm,
+        re.I,
+    ))
+
+    # Department employee requests are intentionally two-step by default:
+    #
+    #   "ابي موظفين الـ IT"          -> summary/count + offer to show list
+    #   "كم عدد موظفين الـ IT؟"      -> count only
+    #   "ابي قائمة موظفين الـ IT"    -> list immediately
+    #   "اعرض موظفين الـ IT"         -> list immediately
+    #
+    # This keeps large employee lists from flooding the chat unless the user
+    # explicitly asks to see them.
+    if department_member_cue and dept_query:
+        explicit_count = bool(re.search(
+            r"(?:كم|عدد|اجمالي|إجمالي|how\s+many|count)",
+            norm,
+            re.I,
+        ))
+        explicit_list = bool(re.search(
+            r"(?:قائمه|قائمة|قايمه|قايمة|ليست|اعرض|أعرض|ورني|وريني|هات\s+القائمه|"
+            r"هات\s+القائمة|هات\s+القايمه|عطني\s+القائمه|عطني\s+القائمة|عطني\s+القايمه|"
+            r"اعطني\s+القائمه|اعطني\s+القائمة|اعطني\s+القايمه|"
+            r"list|show|show\s+me)",
+            norm,
+            re.I,
+        ))
+
+        if explicit_count:
+            names_too = bool(re.search(
+                r"(?:اسماء|أسماء|اسامي|اسمائهم|names)",
+                norm,
+                re.I,
+            ))
+            return make(
+                intent="general_department_counts",
+                operation="calculate",
+                targets=[],
+                fields=["count"] + (["name"] if names_too else []),
+                department_query=dept_query,
+                query="department:count",
+            )
+
+        if explicit_list:
+            return make(
+                intent="general_department_members",
+                operation="list",
+                targets=[],
+                fields=["name", "job_title"],
+                department_query=dept_query,
+                query="department:members",
+            )
+
+        # Default/general mention = two-step summary.
         return make(
-            intent="general_department_counts", operation="calculate", targets=[],
-            fields=["count"] + (["name"] if names_too else []), department_query=dept_query,
-            query="department:count",
+            intent="general_department_counts",
+            operation="lookup",
+            targets=[],
+            fields=["count"],
+            department_query=dept_query,
+            query="department:summary",
         )
-    if re.search(r"(?:موظف|موظفين|موظفي|موظفو|employees?|staff)", norm, re.I) and dept_query:
-        return make(
-            intent="general_department_members", operation="list", targets=[],
-            fields=["name", "job_title"], department_query=dept_query,
-            query="department:members",
-        )
-    if str(last_req_for_units.get("intent") or "") == "general_department_members" and dept_query and len(norm.split()) <= 8:
+    if (str(last_req_for_units.get("intent") or "") == "general_department_members" and dept_query and len(norm.split()) <= 8 and re.search(r"(?:موظف|موظفين|موظفي|ادار|قسم|وحد|قطاع|موظفو|employees?|staff|departments?|divisions?|teams?)", norm, re.I) and not re.search(r"(?:بصم|داوم|دوام|حضور|تأخير|attendance|check.?in|working hours|اجاز|إجاز|رصيد|اجتماع|meeting)", norm, re.I)):
         return make(
             intent="general_department_members", operation="list", targets=[],
             fields=["name", "job_title"], department_query=dept_query,
@@ -1365,19 +2404,55 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
     if writing_cue_early and not is_content_explain_request(norm):
         return make(intent="general", operation="chat", query="general:writing")
 
+    # Mazaya / employee benefits are an enterprise content domain.
+    # Route natural variants to the verified Mazaya API instead of general chat.
+    # Examples:
+    #   "ايش المميزات الي تقدمها لنا الهيئة؟"
+    #   "وش المزايا المتاحة؟"
+    #   "ابي الامتيازات والعروض"
+    #   "what benefits does RCRC offer?"
+    mazaya_cue = bool(re.search(
+        r"(?:مزايا|المزايا|ميزه|ميزة|مميزات|المميزات|امتياز|امتيازات|الامتيازات|"
+        r"benefit|benefits|perk|perks|mazaya)",
+        norm,
+        re.I,
+    ))
+    mazaya_org_cue = bool(
+        re.search(r"(?:الهيئه|الهيئة|rcrc|لنا|للموظفين|employee)", norm, re.I)
+        or re.search(r"(?:تقدم|توفر|تعطي|offer|provide)", norm, re.I)
+    )
+    if mazaya_cue and mazaya_org_cue:
+        return make(
+            intent="mazaya",
+            operation="list",
+            targets=[],
+            fields=["all"],
+            query="",
+        )
+
     # Policies/procedures are their own enterprise domain. Never let a phrase
     # such as "ابحث عن سياسة العمل عن بعد" fall through to employee search.
     policy_cue = bool(re.search(
-        r"(?:سياس(?:ه|ة|ات)|اجراء(?:ات)?|إجراء(?:ات)?|policy|policies|procedure|procedures)",
+        r"(?:سياس(?:ه|ة|ات)|اجراء(?:ات)?|إجراء(?:ات)?|"
+        r"قانون|قوانين|لائحه|لائحة|لوائح|نظام|انظمه|أنظمة|"
+        r"policy|policies|procedure|procedures|rules?|regulations?)",
         norm, re.I,
     ))
     if policy_cue:
+        # General/list-style policy requests retrieve all available policies.
+        if _is_generic_policy_request(raw):
+            return make(
+                intent="policy_search", operation="search", targets=[], fields=[],
+                query="",
+            )
+
         policy_query = raw
         policy_query = re.sub(
             r"^(?:(?:ابحث(?:\s+لي)?\s+عن|دور\s+على|اعرض(?:\s+لي)?|ابي|ابغى|وش|ايش|"
             r"search\s+(?:for\s+)?|find\s+|show\s+(?:me\s+)?|what\s+(?:are|is)\s+the\s+))",
             "", policy_query, flags=re.I,
         ).strip()
+        policy_query = re.sub(r"^(?:هي|the)\s+", "", policy_query, flags=re.I).strip()
         policy_query = re.sub(
             r"^(?:ال)?(?:سياس(?:ه|ة|ات)|اجراء(?:ات)?|إجراء(?:ات)?|policy|policies|procedure|procedures)\s*",
             "", policy_query, flags=re.I,
@@ -1461,6 +2536,59 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
                 targets=[TargetRef(kind="self", name="")], fields=list(dict.fromkeys(manager_fields)),
                 relation_depth=1, query="manager:self_fields",
             )
+
+    # Explicit named-manager relation: "مين مدير ماجد السلطان"
+    # The employee named in the current message always beats old focus.
+    named_manager_match = re.match(
+        r"^(?:مين|من|who\s+is)\s+(?:هو\s+|هي\s+)?(?:مدير|مديرة|manager(?:\s+of)?)\s+(.+?)$",
+        norm,
+        re.I,
+    )
+    if named_manager_match:
+        person_name = re.sub(
+            r"[؟?!.،,]+$",
+            "",
+            str(named_manager_match.group(1) or ""),
+        ).strip()
+        if person_name and person_name not in {"ي", "لي", "حقي", "انا", "أنا", "me", "myself"}:
+            return make(
+                intent="manager",
+                operation="details",
+                targets=[TargetRef(kind="employee", name=person_name)],
+                fields=["name"],
+                relation_depth=1,
+                query="manager:named_employee",
+            )
+
+    # Natural self leave-balance family.
+    # Covers wording such as:
+    #   "كم عندي من رصيد اجازات؟"
+    #   "وش باقي لي اجازات؟"
+    #   "كم باقي من اجازتي؟"
+    #   "how much leave do I have left?"
+    self_leave_balance = bool(
+        re.search(
+            r"(?:رصيد\s*(?:ال)?اجاز|رصيد\s*(?:ال)?إجاز|"
+            r"(?:كم|وش|ايش|ما)\s+(?:باقي|متبقي|متبقى|عندي).*?(?:اجاز|إجاز)|"
+            r"(?:اجاز|إجاز).*?(?:باقي|متبقي|متبقى|رصيد)|"
+            r"(?:leave|vacation).*?(?:balance|remaining|left)|"
+            r"(?:how\s+much|what).*?(?:leave|vacation).*?(?:have|left|remaining))",
+            norm,
+            re.I,
+        )
+    )
+    if self_leave_balance and not re.search(
+        r"(?:مديري|manager|اجازاته|إجازاته|اجازتها|إجازتها|his\s+leave|her\s+leave)",
+        norm,
+        re.I,
+    ):
+        return make(
+            intent="leave_balance",
+            operation="lookup",
+            targets=[TargetRef(kind="self", name="")],
+            fields=["balance"],
+            query="leave:self_balance",
+        )
 
     # RCRC-FIX-v137: third-person leave wording must preserve the referenced
     # employee. Never silently convert "رصيد اجازاته" / "إجازاتها" to self.
@@ -1782,6 +2910,26 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
     if re.search(r"(?:تحويلت(?:ها|ه)|تحويل(?:ها|ه)|تحويله|تحويلة|extension)", norm, re.I):
         contact_fields.append("extension")
 
+    # English pronoun follow-up firewall. When a verified employee is already
+    # in focus, words such as "his" / "her" are references, never names.
+    # Run this BEFORE named-person extraction so Critical Fallback cannot turn
+    # "can you give me his email and phone number" into an employee search.
+    if has_focus and re.search(r"\b(?:his|her|him|he|she)\b", norm, re.I):
+        pronoun_fields = list(contact_fields)
+        if re.search(r"(?:job\s+title|position|role)", norm, re.I) and "job_title" not in pronoun_fields:
+            pronoun_fields.append("job_title")
+        if re.search(r"(?:department|division|unit)", norm, re.I) and "department" not in pronoun_fields:
+            pronoun_fields.append("department")
+        if re.search(r"(?:name|who\s+is\s+(?:he|she))", norm, re.I) and "name" not in pronoun_fields:
+            pronoun_fields.append("name")
+        if pronoun_fields:
+            return make(
+                intent="employee_details", operation="details",
+                targets=[TargetRef(kind="focus", name="")],
+                fields=list(dict.fromkeys(pronoun_fields)),
+                query="employee:focus_fields",
+            )
+
     # Role-title requests can ask for contact fields too. Handle them before
     # named-person extraction so "ايميل مدير إدارة ..." stays a role lookup.
     raw_role_lead = re.sub(
@@ -1907,22 +3055,9 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
             named_detail_fields.append("department")
 
     if named_detail_fields and not re.search(r"(?:ايميلي|بريدي|جوالي|موبايلي|تحويلتي|منصبي|مسماي|ادارتي|إدارتي|my\s+email|my\s+(?:phone|mobile)|my\s+(?:job\s+)?title|my\s+department)", norm, re.I):
-        recent_mentioned = recent_employee_mentioned(norm)
-        if recent_mentioned:
-            explicit_name = str(
-                recent_mentioned.get("name_ar")
-                or recent_mentioned.get("name")
-                or recent_mentioned.get("name_en")
-                or ""
-            ).strip()
-            if explicit_name:
-                return make(
-                    intent="employee_details", operation="details",
-                    targets=[TargetRef(kind="employee", name=explicit_name)],
-                    fields=list(dict.fromkeys(named_detail_fields)),
-                    query="employee:explicit_fields_recent",
-                )
-
+        # Parse an explicitly typed employee in the CURRENT message before using
+        # recent conversational focus. Example: "ابي ايميل اوس الدعجان" after
+        # "مين مديري" must refer to أوس, not the manager.
         detail_name = norm
         detail_name = re.sub(r"^(?:(?:طيب|تمام|ووش|وش|ايش|ابي|ابغى|عطني|اعطني|هات|ممكن|please|give\s+me)\s+)+", "", detail_name, flags=re.I).strip()
         # Remove field phrases wherever they appear, including attached Arabic
@@ -2031,6 +3166,71 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
         return make(intent="reporting_employees", operation="list", targets=[TargetRef(kind="focus", name="")], fields=["name", "job_title"])
 
     last_req = state.get("last_request") if isinstance(state.get("last_request"), dict) else {}
+
+    # v178: keep short explicit date/month replies inside attendance even when
+    # there is no pending clarification (for example after a UI retry).
+    if str(last_req.get("intent") or "") in {"attendance_today", "attendance_history", "working_hours"} and _has_explicit_period_cue(raw):
+        try:
+            selected_period, selected_start, selected_end = _attendance_period(raw)
+            last_attendance_intent = str(last_req.get("intent") or "attendance_history")
+            restored_intent = (
+                "working_hours"
+                if last_attendance_intent == "working_hours"
+                else ("attendance_today" if selected_period == "today" else "attendance_history")
+            )
+            return make(
+                intent=restored_intent,
+                operation="lookup",
+                targets=[TargetRef(kind="self", name="")],
+                fields=["all"],
+                period=selected_period,
+                start_date=selected_start,
+                end_date=selected_end,
+                query=str(last_req.get("query") or ("attendance:working_hours" if restored_intent == "working_hours" else "attendance:summary")),
+                confidence=1.0,
+            )
+        except Exception:
+            pass
+
+    # Explicit Tawasul calendar request.
+    if (
+        re.search(r"(?:تواصل|tawasul)", norm, re.I)
+        and re.search(
+            r"(?:فعالي|دعوات?|دعوه|دعوة|اجتماعات?|events?|invitations?)",
+            norm, re.I,
+        )
+    ):
+        period = "none"
+        start_date = ""
+        end_date = ""
+        if _has_explicit_period_cue(raw):
+            try:
+                period, start_date, end_date = _availability_period(raw)
+            except Exception:
+                period = "none"
+        else:
+            last = state.get("last_request") if isinstance(state.get("last_request"), dict) else {}
+            if str(last.get("intent") or "") in {"meetings", "meeting_list"}:
+                period = str(last.get("period") or "none")
+                start_date = str(last.get("start_date") or "")
+                end_date = str(last.get("end_date") or "")
+
+        return make(
+            intent="meetings",
+            operation="list",
+            targets=[TargetRef(kind="self", name="")],
+            fields=[
+                "subject", "start_time", "end_time", "location",
+                "organizer_name", "my_response", "teams_link",
+            ],
+            period=period,
+            start_date=start_date,
+            end_date=end_date,
+            query="meetings:tawasul",
+            clarification_reason="" if period != "none" else "missing_date_range",
+            confidence=1.0,
+        )
+
     period_only_map = (
         ("today", r"^(?:اليوم|today)$"),
         ("tomorrow", r"^(?:بكره|بكرة|غدا|غداً|tomorrow)$"),
@@ -2165,30 +3365,130 @@ def _critical_orchestrator_preflight(message: str, state: dict[str, Any], langua
     # attendance period instead of accidentally following an employee focus.
     attendance_context = state.get("attendance_context") if isinstance(state.get("attendance_context"), dict) else {}
     attendance_followup = bool(re.search(
-        r"(?:حضوري|الحضور|جدول\s+حضوري|متي\s+(?:حضرت|دخلت|جيت|وصلت|طلعت|خرجت|انصرفت)|"
-        r"وقت\s+(?:دخولي|خروجي)|ساعات\s+(?:دوامي|عملي)|check[- ]?in|check[- ]?out|attendance|working\s+hours)",
+        r"(?:حضوري|الحضور|حضور|بصمتي|دوامي|جدول\s+حضوري|"
+        r"متي\s+(?:حضرت|دخلت|جيت|وصلت|طلعت|خرجت|انصرفت)|"
+        r"وقت\s+(?:دخولي|خروجي)|ساعات\s+(?:دوامي|عملي)|"
+        r"تاخير|تأخير|تأخرت|تاخرت|متاخر|متأخر|lateness|late|delay|"
+        r"اوفر\s*تايم|أوفر\s*تايم|اضافي|إضافي|وقت\s+اضافي|وقت\s+إضافي|overtime|"
+        r"ناقصني|النقص|فرق\s+(?:الدوام|الساعات)|difference|shortfall|"
+        r"الساعات\s+(?:المطلوبه|المطلوبة|الرسميه|الرسمية)|regular\s+hours|"
+        r"اجازه|اجازة|إجازة|اوف\s*داي|أوف\s*داي|off\s+day|weekend|نوع\s+اليوم|يوم\s+دوام|"
+        r"بصم|بصمة|fingerprint|punch|"
+        r"check[- ]?in|check[- ]?out|attendance|working\s+hours)",
         norm, re.I,
     ))
     if attendance_followup:
-        explicit_period = None
-        if re.search(r"(?:امس|yesterday)", norm, re.I): explicit_period = "yesterday"
-        elif re.search(r"(?:الاسبوع\s+(?:الي|اللي)?\s*راح|الاسبوع\s+الماضي|last\s+week)", norm, re.I): explicit_period = "last_week"
-        elif re.search(r"(?:اليوم|today)", norm, re.I): explicit_period = "today"
-        # A full new attendance request defaults to today. Only a short field
-        # follow-up such as "متى خرجت؟" inherits yesterday/last week.
-        full_attendance_request = bool(re.search(r"(?:حضوري|الحضور|جدول\s+حضوري|ساعات\s+(?:دوامي|عملي)|attendance|working\s+hours)", norm, re.I))
-        inherited = str(attendance_context.get("period") or "today") if not full_attendance_request else ""
-        period = explicit_period or inherited
+        has_explicit_time = _has_explicit_period_cue(raw)
+        selected_period, selected_start, selected_end = ("none", "", "")
+        if has_explicit_time:
+            selected_period, selected_start, selected_end = _attendance_period(raw)
+            if selected_period == "none":
+                has_explicit_time = False
+
+        # A full new attendance request only asks for a date when the user truly
+        # omitted it. Any resolved day/range is final and must not be clarified
+        # again later in the turn.
+        full_attendance_request = bool(re.search(
+            r"(?:حضوري|الحضور|حضور|بصمتي|دوامي|جدول\s+حضوري|"
+            r"ساعات\s+(?:دوامي|عملي)|تاخير|تأخير|تأخرت|تاخرت|lateness|late|delay|"
+            r"اوفر\s*تايم|أوفر\s*تايم|اضافي|إضافي|overtime|"
+            r"ناقصني|النقص|فرق\s+(?:الدوام|الساعات)|difference|shortfall|"
+            r"الساعات\s+(?:المطلوبه|المطلوبة|الرسميه|الرسمية)|regular\s+hours|"
+            r"اجازه|اجازة|إجازة|اوف\s*داي|أوف\s*داي|off\s+day|weekend|نوع\s+اليوم|يوم\s+دوام|"
+            r"بصم|بصمة|fingerprint|punch|"
+            r"attendance|working\s+hours)",
+            norm,
+            re.I,
+        ))
+        inherited_period = str(attendance_context.get("period") or "today") if not full_attendance_request else ""
+        inherited_start = str(attendance_context.get("start_date") or "") if not full_attendance_request else ""
+        inherited_end = str(attendance_context.get("end_date") or "") if not full_attendance_request else ""
+
+        period = selected_period if has_explicit_time else inherited_period
+        start_date = selected_start if has_explicit_time else inherited_start
+        end_date = selected_end if has_explicit_time else inherited_end
+
         checkout = bool(re.search(r"(?:طلعت|خرجت|انصرفت|خروجي|check[- ]?out|leave)", norm, re.I))
         checkin = bool(re.search(r"(?:حضرت|دخلت|جيت|وصلت|دخولي|check[- ]?in|arrive)", norm, re.I))
         working = bool(re.search(r"(?:ساعات\s+(?:دوامي|عملي)|working\s+hours)", norm, re.I))
-        intent = "working_hours" if working else ("attendance_today" if period in {"", "today"} else "attendance_history")
-        query = "attendance:working_hours" if working else ("attendance:check_out" if checkout else ("attendance:check_in" if checkin else "attendance:summary"))
+        lateness = bool(re.search(r"(?:تاخير|تأخير|تأخرت|تاخرت|متاخر|متأخر|lateness|late|delay)", norm, re.I))
+        overtime = bool(re.search(r"(?:اوفر\s*تايم|أوفر\s*تايم|وقت\s+(?:اضافي|إضافي)|ساعات\s+(?:اضافيه|إضافية)|overtime|extra\s+hours)", norm, re.I))
+        difference = bool(re.search(r"(?:ناقصني|النقص|فرق\s+(?:الدوام|الساعات)|difference|shortfall)", norm, re.I))
+        regular_hours = bool(re.search(r"(?:الساعات\s+(?:المطلوبه|المطلوبة|الرسميه|الرسمية)|regular\s+hours|required\s+hours)", norm, re.I))
+        day_type = bool(re.search(
+            r"(?:اجازه|اجازة|إجازة|اوف\s*داي|أوف\s*داي|off\s+day|weekend|"
+            r"نوع\s+اليوم|يوم\s+دوام|كان\s+دوام|holiday|leave\s+day)",
+            norm, re.I,
+        ))
+        punch_status = bool(re.search(
+            r"(?:بصم|بصمة|بصمات|fingerprint|punch|نسي\s+(?:البصمه|البصمة)|"
+            r"دخول\s+وخروج|check[- ]?in\s+and\s+check[- ]?out)",
+            norm, re.I,
+        ))
+
+        today_iso = datetime.now(timezone(timedelta(hours=3))).date().isoformat()
+        is_today = bool(start_date and start_date == end_date == today_iso) or period == "today"
+        intent = "working_hours" if working else ("attendance_today" if is_today else "attendance_history")
+
+        if lateness:
+            query = "attendance:lateness"
+        elif overtime:
+            query = "attendance:overtime"
+        elif difference:
+            query = "attendance:difference"
+        elif regular_hours:
+            query = "attendance:regular_hours"
+        elif day_type:
+            query = "attendance:day_type"
+        elif punch_status:
+            query = "attendance:punch_status"
+        elif working:
+            query = "attendance:working_hours"
+        elif checkout:
+            query = "attendance:check_out"
+        elif checkin:
+            query = "attendance:check_in"
+        else:
+            query = "attendance:summary"
         return make(
             intent=intent, operation="lookup", targets=[TargetRef(kind="self", name="")],
-            fields=["all"], period=period or "none", query=query,
-            clarification_reason="missing_date_range" if full_attendance_request and not explicit_period else "",
+            fields=["all"], period=period or "none", start_date=start_date, end_date=end_date, query=query,
+            clarification_reason="missing_date_range" if full_attendance_request and not has_explicit_time else "",
+            confidence=1.0 if has_explicit_time else 0.99,
         )
+
+    # Natural content follow-up. If the last verified list contains exactly
+    # one item, phrases such as "ابي تفاصيلها" / "افتحها" / "ورني اكثر"
+    # automatically refer to that single content item. This runs BEFORE the
+    # employee-focus fallback so a previous employee focus cannot hijack it.
+    generic_content_detail = bool(re.fullmatch(
+        r"(?:(?:طيب|تمام|اوكي|أوكي|ok|okay)\s+)?"
+        r"(?:(?:ابي|ابغى|أبي|أبغى|عطني|اعطني|أعطني|ورني|وريني|افتح|افتحها|show|open)\s+)?"
+        r"(?:تفاصيل(?:ها|ه)?|التفاصيل(?:\s+كامله|\s+كاملة)?|"
+        r"معلومات(?:ها|ه)?|المزيد|اكثر|أكثر|more|details?|full\s+details?)",
+        norm,
+        re.I,
+    ))
+    if generic_content_detail:
+        _ls = state.get("list_state") if isinstance(state.get("list_state"), dict) else {}
+        _items = [x for x in (_ls.get("items") or []) if isinstance(x, dict)]
+        _base_to_detail = {
+            "news": "news_details",
+            "announcements": "announcement_details",
+            "mazaya": "mazaya_details",
+            "policy_search": "policy_details",
+        }
+        _detail_intent = _base_to_detail.get(str(_ls.get("intent") or ""), "")
+        if _detail_intent and len(_items) == 1:
+            return make(
+                intent=_detail_intent,
+                operation="details",
+                targets=[],
+                fields=["all"],
+                ordinal=1,
+                query="content:single_auto",
+                confidence=1.0,
+            )
 
     # Pronouns such as "his email" always mean the current VERIFIED employee,
     # while "my email" remains self. Run this before the self-field rules.
@@ -2323,21 +3623,10 @@ def _log_nlu_miss(message: str, reason: str, state: dict[str, Any]) -> None:
 
 
 def _friendly_clarification(message: str, language: str) -> str:
-    """RCRC-FIX-v2: short, natural clarification with an example close to what was asked."""
-    norm = _norm_role_text(message)
+    """A short, friendly experimental-stage clarification."""
     if language != "ar":
-        return "Sorry, I didn't quite get that 😅 Could you rephrase? For example: \"Who is Shahah's manager?\" or \"What's my leave balance?\""
-    examples = (
-        (r"(?:اجاز|رصيد|يبقى|يبقي|خذت)", "«كم رصيد إجازاتي؟» أو «إذا أخذت يومين إجازة كم يبقى لي؟»"),
-        (r"(?:مدير)", "«مين مديري؟» أو «مين مدير شاهه العقيل؟»"),
-        (r"(?:اجتماع|فاضي|متاح|مشغول)", "«اجتماعاتي بكرة» أو «متى عماد فاضي بكرة؟»"),
-        (r"(?:ايميل|بريد|جوال|رقم|تحويل)", "«ايميل عماد الهاجري» أو «رقم جوال شاهه»"),
-        (r"(?:معامل|تراسل)", "«كم معاملة عندي؟» أو «تفاصيل معاملاتي»"),
-    )
-    for pattern, example in examples:
-        if re.search(pattern, norm):
-            return f"آسف، ما فهمت قصدك بالضبط 😅 ممكن توضح أكثر؟ مثلًا: {example}"
-    return "آسف، ما فهمت قصدك بالضبط 😅 ممكن توضح أكثر؟ مثلًا: «مين مديري؟» أو «ايميل عماد الهاجري» أو «آخر الأخبار»."
+        return "Sorry 😅 I'm still in my experimental phase and I didn't understand that request this time. Could you rephrase it a little?"
+    return "آسف 😅 أنا لسه بمرحلتي التجريبية وما فهمت طلبك هالمرة. ممكن توضحه لي شوي؟"
 
 
 def _greeting(message: str, language: str) -> str | None:
@@ -2355,7 +3644,7 @@ def _greeting(message: str, language: str) -> str | None:
             or re.fullmatch(r"ه+ل+و+", compact)
             or re.fullmatch(r"ه+ي+ل+و+", compact)
         ):
-            return "هلا فيك! كيف أقدر أساعدك؟"
+            return "هلا فيك 👋 وش أقدر أساعدك فيه؟"
 
         greeting_words = {
             "هلا",
@@ -2398,10 +3687,10 @@ def _greeting(message: str, language: str) -> str | None:
         }
 
         if norm in conversation_openers:
-            return "أكيد، اسألني."
+            return "طبعًا، اسألني 😊"
 
         if norm in greeting_words:
-            return "هلا فيك! كيف أقدر أساعدك؟"
+            return "هلا فيك 👋 وش أقدر أساعدك فيه؟"
 
         has_greeting = any(
             norm == item
@@ -2415,7 +3704,7 @@ def _greeting(message: str, language: str) -> str | None:
         )
 
         if has_greeting and has_small_talk:
-            return "هلا فيك! بخير الحمدلله 😊 كيف أقدر أساعدك؟"
+            return "هلا فيك 👋 بخير الحمدلله 😊 وش أقدر أساعدك فيه؟"
 
         # Do not swallow a real request just because it starts with a greeting.
         # Examples that must continue to NLU:
@@ -2423,7 +3712,7 @@ def _greeting(message: str, language: str) -> str | None:
         #   "هلا مين مديري؟"
         # Pure greetings were already handled by `norm in greeting_words` above.
         if has_small_talk and len(norm.split()) <= 5:
-            return "بخير الحمدلله 😊 كيف أقدر أساعدك؟"
+            return "بخير الحمدلله 😊 وش أقدر أساعدك فيه؟"
 
         return None
 
@@ -2724,6 +4013,41 @@ def _norm_role_text(value: Any) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _is_generic_policy_request(value: Any) -> bool:
+    """True when the user wants the available policy/procedure list."""
+    text = _norm_role_text(value)
+    if not text:
+        return True
+
+    text = re.sub(
+        r"\b(?:show|list|give|tell|what|are|is|the|me|all|available|latest|top|main|"
+        r"policies|policy|procedures|procedure|rules|regulations|rcrc|organization)\b",
+        " ",
+        text,
+        flags=re.I,
+    )
+
+    text = re.sub(
+        r"(?:\b(?:ابي|ابغى|اعطني|عطني|اعرض|ورني|هات|وش|ايش|ما|ماهي|هي|"
+        r"ابرز|اهم|احدث|اخر|كل|جميع|المتاحه|الموجوده|عندكم|لدينا|لي)\b|"
+        r"(?:في|بال|لل)?\s*ال?هي(?:ئ|ي)?ه)",
+        " ",
+        text,
+        flags=re.I,
+    )
+
+    text = re.sub(
+        r"\bو?(?:السياسات|سياسات|السياسه|سياسه|الاجراءات|اجراءات|الاجراء|اجراء|"
+        r"القوانين|قوانين|القانون|قانون|الانظمه|انظمه|النظام|نظام|"
+        r"اللوائح|لوائح|اللائحه|لائحه)\b",
+        " ",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"\b(?:و|and|or)\b", " ", text, flags=re.I)
+    return not re.sub(r"\s+", " ", text).strip()
+
+
 def _role_best_match(data: Any, role_query: str = "") -> dict[str, Any]:
     """Return a safe verified role holder.
 
@@ -2803,9 +4127,9 @@ def _render_role_rows(
 ) -> str:
     clean_rows = [row for row in rows if isinstance(row, dict)][:limit]
     if not clean_rows:
-        return "ما لقيت موظفين مطابقين." if language == "ar" else "I couldn't find matching employees."
+        return "ما لقيت موظف مطابق للاسم هذا حاليًا 🔎😊 تأكد من الاسم وجرب مرة ثانية." if language == "ar" else "I couldn't find matching employees."
 
-    lines = (["النتائج المطابقة:" if language == "ar" else "Matching results:"] if header else [])
+    lines = ([(("أكيد 😊 لقيت لك موظف مطابق:" if len(clean_rows) == 1 else "لقيت لك أكثر من موظف مطابق 👥😊 مين تقصد؟") if language == "ar" else "Matching results:")] if header else [])
     for index, row in enumerate(clean_rows, start=1):
         name = _name(row, language) or _uid(row)
         if language == "ar":
@@ -2848,7 +4172,7 @@ def _generic_policy_navigation(message: str, language: str) -> str | None:
     clean = norm.strip(" ؟?!.,،")
     if any(re.fullmatch(pattern, clean, re.I) for pattern in generic_patterns):
         if language == "ar":
-            return "السياسات والإجراءات تلقينها داخل التطبيق من **المزيد → السياسات والإجراءات**. وإذا كنتِ تقصدين سياسة معيّنة، اكتبي اسمها وأنا أساعدك فيها."
+            return "السياسات والإجراءات تلقينها داخل التطبيق من المزيد → السياسات والإجراءات. وإذا كنتِ تقصدين سياسة معيّنة، اكتبي اسمها وأنا أساعدك فيها."
         return "You can find Policies and Procedures in the app under **More → Policies and Procedures**. If you mean a specific policy, tell me its name and I’ll help."
     return None
 
@@ -3019,7 +4343,7 @@ def _frustration_reply(message: str, state: dict[str, Any], language: str) -> st
         state["task_flow"] = {}
 
     if language == "ar":
-        return "هههه حقك علي 😅 حوّستها عليك. خلينا نمشيها طبيعي—قولي طلبك بطريقتك وأنا بكمل معك من السياق بدون أسئلة محفوظة."
+        return "هههه حقك علي 😅"
     return "Fair 😅 I overcomplicated that. Say it naturally and I’ll continue from the context without forcing a scripted flow."
 
 
@@ -3098,6 +4422,21 @@ def _split_compound_message(message: str) -> list[str]:
     if not raw:
         return []
 
+    # Keep a self-manager request and manager-owned fields in one semantic turn.
+    # Example: "مين مديري المباشر وابي ايميله" should return the manager name
+    # and email together, not execute two near-duplicate agent steps.
+    manager_compound = _norm_role_text(raw)
+    if (
+        re.search(r"(?:مديري|my\s+manager)", manager_compound, re.I)
+        and re.search(
+            r"(?:ايميله|إيميله|بريده|جواله|رقم\s+جواله|تحويلته|منصبه|مسماه|"
+            r"his\s+(?:email|phone|mobile|extension|title)|manager'?s\s+(?:email|phone|mobile|extension|title))",
+            manager_compound,
+            re.I,
+        )
+    ):
+        return [raw]
+
     chunks = [x.strip() for x in re.split(r"[؟?؛;\n]+", raw) if x.strip()]
     output: list[str] = []
     for chunk in chunks:
@@ -3169,7 +4508,13 @@ def _combine_compound_answers(answers: list[str], language: str) -> str:
         # Avoid repetitive conversational openers in one combined response.
         if clean and language == "ar":
             text = re.sub(r"^(?:أكيد|تمام|أبشر|ابشر)[،,:\s]+", "", text).strip()
-        key = re.sub(r"\s+", " ", text).casefold()
+        key_text = re.sub(
+            r"^(?:(?:أكيد|تمام|أبشر|ابشر)\s*)?[😊👌🌷📧📱☎️\s]+",
+            "",
+            text,
+            flags=re.I,
+        ).strip()
+        key = re.sub(r"\s+", " ", key_text).casefold()
         if key and key not in seen:
             seen.add(key)
             clean.append(text)
@@ -3177,41 +4522,69 @@ def _combine_compound_answers(answers: list[str], language: str) -> str:
 
 
 def _friendly_surface(answer: str, language: str) -> str:
-    """Keep verified replies natural without mechanically adding prefixes/emojis."""
+    """Final cleanup only. Tone is owned by each renderer/prompt, not forced globally."""
     text = str(answer or "").strip()
     if not text:
         return text
 
-    # Do not mutate English or factual content. The renderers/prompts own tone.
     if language != "ar":
+        acronyms = {"RCRC", "IT", "HR", "PMO", "ICT", "AI", "OCI", "API", "CAB", "SQL", "MCP", "SSO"}
+        def _fix_caps(match: re.Match[str]) -> str:
+            word = match.group(0)
+            return word.upper() if word.upper() in acronyms else word.capitalize()
+
+        text = re.sub(r"\b[A-Z]{3,}\b", _fix_caps, text)
+        text = text.replace("**", "")
         return text
 
-    # Remove accidental duplicate friendly openers produced by layered renderers.
-    text = re.sub(r"^(?:أكيد\s*[🌷😊👌]?\s*){2,}", "أكيد، ", text).strip()
+    # Keep user-facing text clean without forcing the same opener on every reply.
+    # Preserve lightweight markdown emphasis; the frontend already renders it.
+    text = re.sub(r"^(?:أكيد\s*[🌷😊👌]?\s*){2,}", "أكيد 😊 ", text).strip()
 
-    # Turn the common three-line employee card into a natural sentence while
-    # preserving the exact verified values returned by the renderer. Lists and
-    # large structured answers stay structured because that is easier to scan.
-    profile_card = re.fullmatch(
-        r"أكيد،?\s*عن\s+(.+?):\s*\n-\s*الاسم:\s*(.+?)\s*\n-\s*المسمى\s+الوظيفي:\s*(.+?)\s*\n-\s*الإدارة:\s*(.+?)\s*",
-        text,
-        re.S,
-    )
-    if profile_card:
-        name = profile_card.group(2).strip() or profile_card.group(1).strip()
-        title = profile_card.group(3).strip()
-        department = profile_card.group(4).strip()
-        return f"أكيد، {name} يعمل كـ {title} ضمن {department}."
-
-    text = text.replace("تقصد أي موظف؟", "مين تقصد بالضبط؟ اكتب لي اسم الموظف.")
-
-    # Never prepend a generic word/emoji to every API answer. A friendly assistant
-    # can also be direct: "مديرك المباشر..." / "عندك اجتماعين..." etc.
+    # Frontend currently renders markdown markers literally.
+    # Never expose ** in user-facing answers.
+    text = text.replace("**", "")
     return text
 
 
 def _clear_pending(state: dict[str, Any]) -> None:
     state["pending"] = {"kind": "", "query": "", "candidates": [], "request": {}, "message": ""}
+
+
+def _set_employee_more_details_pending(
+    state: dict[str, Any],
+    request: ParsedRequest,
+    *,
+    self_subject: bool,
+) -> None:
+    """Persist the renderer's "job title and department?" offer."""
+    if self_subject or request.intent != "employee_details":
+        return
+    fields = [str(field) for field in (request.fields or [])]
+    field_set = set(fields)
+    contact_fields = {"email", "mobile", "extension"}
+    if not (2 <= len(fields) <= 3):
+        return
+    if not field_set.intersection(contact_fields):
+        return
+    if field_set.intersection({"job_title", "department"}):
+        return
+
+    follow_req = ParsedRequest(
+        intent="employee_details",
+        operation="details",
+        targets=[TargetRef(kind="focus", name="")],
+        fields=["job_title", "department"],
+        query="employee:focus_more_details",
+        confidence=1.0,
+    )
+    state["pending"] = {
+        "kind": "employee_more_details",
+        "query": "",
+        "candidates": [],
+        "request": follow_req.model_dump(),
+        "message": "after_employee_contact_card",
+    }
 
 
 def _record_request(state: dict[str, Any], request: ParsedRequest) -> None:
@@ -3231,6 +4604,24 @@ def _record_request(state: dict[str, Any], request: ParsedRequest) -> None:
         "role_query": str(request.role_query or ""),
         "department_query": str(request.department_query or ""),
         "amount": request.amount,
+    }
+
+    # v232 Context Engine: persist only structural conversation state.
+    # No employee facts are copied here. This lets short follow-ups inherit the
+    # active domain/view/date without replaying arbitrary old chat history.
+    first_target = request.targets[0].model_dump() if request.targets else {}
+    state["conversation_context"] = {
+        "active_domain": str(request.intent or ""),
+        "active_view": str(request.query or ""),
+        "operation": str(request.operation or ""),
+        "period": str(request.period or "none"),
+        "start_date": str(request.start_date or ""),
+        "end_date": str(request.end_date or ""),
+        "time_query": str(getattr(request, "time_query", "") or ""),
+        "fields": list(request.fields or [])[:12],
+        "target_kind": str(first_target.get("kind") or ""),
+        # name is intentionally omitted: verified identity remains in focus.
+        "has_target": bool(first_target),
     }
 
 
@@ -3362,16 +4753,254 @@ def _content_item_text(row: dict[str, Any]) -> str:
 
 
 def _rows_from_data(data: Any) -> list[dict[str, Any]]:
+    """
+    Extract list rows from direct payloads and standard RCRC API wrappers.
+
+    The important rule is that context/pending logic must see the same rows
+    the renderer sees. MeetingList commonly returns:
+        {"data": {"meetings": [...]}}
+    """
     if isinstance(data, list):
         return [row for row in data if isinstance(row, dict)]
+
     if not isinstance(data, dict):
         return []
-    for key in ("employees", "items", "results", "data", "rows", "meetings", "transactions"):
+
+    for key in (
+        "employees", "items", "results", "rows", "meetings", "transactions",
+        "attendance", "vacations", "policies", "news", "announcements", "benefits",
+    ):
         value = data.get(key)
         if isinstance(value, list):
             return [row for row in value if isinstance(row, dict)]
+
+    nested = data.get("data")
+    if isinstance(nested, list):
+        return [row for row in nested if isinstance(row, dict)]
+    if isinstance(nested, dict):
+        return _rows_from_data(nested)
+
     return []
 
+
+def _content_selection_number(message: str) -> int:
+    raw = str(message or "").strip().translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+    raw = re.sub(r"[؟?!.،,]+", " ", raw)
+    norm = " ".join(raw.casefold().split())
+    direct = re.fullmatch(r"(?:(?:رقم|number|#)\s*)?(\d{1,2})", norm, re.I)
+    if direct:
+        return int(direct.group(1))
+    ordinal_words = {
+        "الاول": 1, "الأول": 1, "اول": 1, "أول": 1, "first": 1,
+        "الثاني": 2, "ثاني": 2, "second": 2,
+        "الثالث": 3, "ثالث": 3, "third": 3,
+        "الرابع": 4, "رابع": 4, "fourth": 4,
+        "الخامس": 5, "خامس": 5, "fifth": 5,
+        "السادس": 6, "سادس": 6, "sixth": 6,
+        "السابع": 7, "سابع": 7, "seventh": 7,
+        "الثامن": 8, "ثامن": 8, "eighth": 8,
+        "التاسع": 9, "تاسع": 9, "ninth": 9,
+        "العاشر": 10, "عاشر": 10, "tenth": 10,
+    }
+    cleaned = re.sub(r"^(?:ابي|أبي|ابغى|أبغى|اختار|اخترت|رقم|number)\s+", "", norm, flags=re.I).strip()
+    return ordinal_words.get(cleaned, 0)
+
+
+def _is_email_drafting_request(message: str) -> bool:
+    """True only when the user wants us to WRITE an email, not look one up."""
+    norm = _norm_role_text(str(message or ""))
+    has_email = bool(re.search(r"(?:ايميل|إيميل|ايميلًا|ايميلاً|رساله\s+ايميل|email|e-mail)", norm, re.I))
+    has_write = bool(re.search(
+        r"(?:اكتب(?:\s+لي)?|اكتبي(?:\s+لي)?|صيغ(?:\s+لي)?|صيغي(?:\s+لي)?|"
+        r"صياغ(?:ه|ة)|جهز(?:\s+لي)?|حضّر(?:\s+لي)?|حضر(?:\s+لي)?|"
+        r"ابي\s+(?:اكتب|ارسل)|ابغى\s+(?:اكتب|ارسل)|بكتب|برسل|"
+        r"write|draft|compose|help\s+me\s+write)",
+        norm, re.I,
+    ))
+    return has_email and has_write
+
+
+def _writing_context(state: dict[str, Any]) -> dict[str, Any]:
+    value = state.get("writing_context") if isinstance(state, dict) else {}
+    return value if isinstance(value, dict) else {}
+
+
+def _writing_followup_target_language(message: str, state: dict[str, Any]) -> str:
+    """Resolve the output language for a revision/translation follow-up."""
+    norm = _norm_role_text(str(message or ""))
+    ctx = _writing_context(state)
+    previous = str(ctx.get("language") or "").strip().lower()
+
+    if re.search(r"(?:بالانجليزي|بالإنجليزي|انجليزي|إنجليزي|english|to\s+english|translate\s+to\s+english)", norm, re.I):
+        return "en"
+    if re.search(r"(?:بالعربي|بالعربية|عربي|العربيه|العربية|arabic|to\s+arabic|translate\s+to\s+arabic)", norm, re.I):
+        return "ar"
+
+    # Bare "ترجمه/translate it" means translate the current draft to the
+    # other supported language. Other edit requests preserve draft language.
+    bare_translate = bool(re.fullmatch(
+        r"(?:ترجم(?:ه|ها|يه|يها|لي|ها\s+لي)?|ترجمة|translate(?:\s+it)?|translate)",
+        norm.strip(" ؟?!.،,"), re.I,
+    ))
+    if bare_translate:
+        return "en" if previous == "ar" else "ar"
+    return previous if previous in {"ar", "en"} else detect_language(message, fallback="ar")
+
+
+def _is_writing_followup_request(message: str, state: dict[str, Any]) -> bool:
+    """Short natural edits that should modify the last generated draft."""
+    ctx = _writing_context(state)
+    if str(ctx.get("kind") or "") != "email" or not str(ctx.get("draft") or "").strip():
+        return False
+
+    norm = _norm_role_text(str(message or "")).strip()
+    # Explicitly drafting a NEW email should use the new-draft hard route.
+    if _is_email_drafting_request(message):
+        return False
+
+    patterns = (
+        # Natural Gulf/Arabic follow-ups such as "ابيه لطيف اكثر" or
+        # "أبيها أقصر" refer to the current draft when one exists.
+        r"(?:خله|خليها|خليه|اجعله|اجعلها|ابيه|أبيه|ابيها|أبيها|ابغاه|أبغاه|ابغاها|أبغاها|make\s+it)",
+        r"(?:رسمي|اكثر\s+رسمي|أكثر\s+رسم|formal|professional|لطيف|ألطف|الطف|ودود|ودي|ودّي|friendly|warm|warmer|مباشر|direct|واضح|أوضح|مهني|professional)",
+        r"(?:اختصر|اختصره|اختصري|اقصر|أقصر|shorter|concise|مختصر)",
+        r"(?:طوله|اطوله|أطوله|longer|وسع|وسعه)",
+        r"(?:ترجم|ترجمه|ترجمها|ترجملي|ترجمي|ترجمة|translate|بالانجليزي|بالإنجليزي|بالعربي|بالعربية|english|arabic)",
+        r"(?:غير|غيّر|عدل|عدّل|بدل|بدّل|change|revise|rewrite|edit)",
+        r"(?:البداية|النهاية|العنوان|subject|opening|ending|last\s+paragraph|first\s+paragraph)",
+        r"(?:شيل|احذف|حذف|remove|delete|اضف|أضف|زيد|add)",
+        r"(?:لا\s+تذكر|لا\s+تحط|بدون|without)",
+    )
+    return any(re.search(p, norm, re.I) for p in patterns)
+
+
+def _email_request_is_vague(message: str) -> bool:
+    """A bare 'write me an email' needs the topic/purpose, not an API lookup."""
+    norm = _norm_role_text(str(message or "")).strip(" ؟?!.،,")
+    stripped = re.sub(
+        r"(?:ابي|ابغى|ممكن|لو\s+سمحت|please|can\s+you|could\s+you|"
+        r"اكتب(?:\s+لي)?|اكتبي(?:\s+لي)?|صيغ(?:\s+لي)?|صيغي(?:\s+لي)?|"
+        r"جهز(?:\s+لي)?|حضّر(?:\s+لي)?|حضر(?:\s+لي)?|write(?:\s+me)?|draft(?:\s+me)?|compose|"
+        r"ايميل|إيميل|email|e-mail)",
+        " ", norm, flags=re.I,
+    )
+    stripped = " ".join(stripped.split()).strip(" ؟?!.،,")
+    return len(stripped) < 3
+
+
+def _friendly_endpoint_answer(answer: str, intent: str, language: str) -> str:
+    """Give verified endpoint answers a warm, concise Sanad tone.
+
+    This is presentation-only: it never changes facts, IDs, routing or tool data.
+    Errors/empty-state messages keep their original wording so we do not prefix
+    failures with an inappropriate "أكيد" / "Sure".
+    """
+    text = str(answer or "").strip()
+    if not text:
+        return text
+
+    first = text.splitlines()[0].strip()
+    if language == "ar":
+        failure_starts = (
+            "ما قدرت", "ما لقيت", "ما فيه", "للأسف", "آسف", "عذرًا",
+            "هذي المعلومة", "هذه المعلومة", "سجّل", "تعذر", "غير متوفر",
+        )
+        if first.startswith(failure_starts):
+            return text
+        # Already conversational/friendly: do not duplicate a lead-in.
+        if first.startswith(("أكيد", "أبشر", "أبشري", "حصلته", "لقيت", "تمام", "هذي", "هذا", "عندك", "ما عندك", "مرحب")):
+            return text
+        return f"أكيد 😊\n{text}"
+
+    failure_starts = ("Sorry", "I couldn't", "I can’t", "No ", "There are no", "Please sign in")
+    if first.startswith(failure_starts) or first.startswith(("Sure", "Of course", "Got it", "I found", "Here are", "You have", "You don't", "Your ")):
+        return text
+    return f"Sure 😊\n{text}"
+
+
+def _restore_content_detail_selection(message: str, state: dict[str, Any]) -> ParsedRequest | None:
+    pending = state.get("pending") if isinstance(state.get("pending"), dict) else {}
+    if str(pending.get("kind") or "") != "content_detail_selection":
+        return None
+    raw_req = pending.get("request") if isinstance(pending.get("request"), dict) else {}
+    index = _content_selection_number(message)
+    if not raw_req or index <= 0:
+        return None
+    list_state = state.get("list_state") if isinstance(state.get("list_state"), dict) else {}
+    items = [x for x in (list_state.get("items") or []) if isinstance(x, dict)]
+    if not (1 <= index <= len(items)):
+        return None
+    try:
+        restored = ParsedRequest.model_validate(raw_req)
+    except Exception:
+        return None
+    restored.ordinal = index
+    restored.operation = "details"
+    restored.fields = ["all"]
+    restored.query = ""
+    restored.clarification_reason = ""
+    restored.confidence = 1.0
+    state["pending"] = {"kind": "", "query": "", "candidates": [], "request": {}, "message": ""}
+    return restored
+
+
+def _restore_full_content_followup(message: str, state: dict[str, Any]) -> ParsedRequest | None:
+    raw = str(message or "").strip()
+    norm = re.sub(r"[؟?!.،,]+", " ", raw.casefold())
+    norm = " ".join(norm.split())
+    pending = state.get("pending") if isinstance(state.get("pending"), dict) else {}
+    pending_full = str(pending.get("kind") or "") == "content_full_details"
+    confirmation = bool(re.fullmatch(
+        r"(?:اي|ايوه|أيوه|نعم|تمام|طيب|اوكي|أوكي|ok|yes|yeah|yep|جيبه|جيبها|هات|اعرضه|اعرضها|كامل|كامله|كاملة)",
+        norm, re.I,
+    ))
+    full_cue = bool(re.search(
+        r"(?:التفاصيل\s+(?:كامله|كاملة)(?:\s+(?:للخبر|للاعلان|للإعلان|للميزه|للميزة|للسياسه|للسياسة))?|"
+        r"كامل\s+التفاصيل|كل\s+التفاصيل|التفاصيل\s+بالكامل|"
+        r"الخبر\s+كامل|كامل\s+الخبر|الاعلان\s+كامل|الإعلان\s+كامل|"
+        r"كامل\s+الاعلان|كامل\s+الإعلان|full\s+details?|show\s+all\s+details?|full\s+article)",
+        norm, re.I,
+    ))
+    if not full_cue and not (pending_full and confirmation):
+        return None
+
+    # A confirmation such as "اي" / "جيبه" after Sanad explicitly offered
+    # the full verified item stays locked to the same content focus.
+    if pending_full and confirmation:
+        state["pending"] = {"kind": "", "query": "", "candidates": [], "request": {}, "message": ""}
+
+    # Primary source: explicit verified content focus.
+    focus = state.get("content_focus") if isinstance(state.get("content_focus"), dict) else {}
+    intent = str(focus.get("detail_intent") or "")
+
+    # Persistent fallback: selected content is also stored inside list_state,
+    # which survives normal conversation-memory cleanup. This prevents phrases
+    # such as "التفاصيل الكاملة للخبر" from ever falling through to employee search.
+    if intent not in DETAIL_BASE_INTENT:
+        list_state = state.get("list_state") if isinstance(state.get("list_state"), dict) else {}
+        selected_intent = str(list_state.get("selected_detail_intent") or "")
+        if selected_intent in DETAIL_BASE_INTENT:
+            intent = selected_intent
+        else:
+            base_to_detail = {
+                "news": "news_details",
+                "announcements": "announcement_details",
+                "mazaya": "mazaya_details",
+                "policy_search": "policy_details",
+            }
+            if int(list_state.get("selected_index") or 0) > 0:
+                intent = base_to_detail.get(str(list_state.get("intent") or ""), "")
+
+    if intent not in DETAIL_BASE_INTENT:
+        return None
+
+    return ParsedRequest(
+        intent=intent, operation="details", targets=[], fields=["all"],
+        query="content:full", role_query="", department_query="",
+        period="none", start_date="", end_date="", ordinal=0,
+        relation_depth=1, amount=None, time_query="", confidence=1.0,
+        clarification_reason="",
+    )
 
 def _choose_content_item(request: ParsedRequest, state: dict[str, Any]) -> dict[str, Any] | None:
     list_state = state.get("list_state") if isinstance(state.get("list_state"), dict) else {}
@@ -3430,8 +5059,11 @@ class Orchestrator:
             except Exception as exc:
                 print(f"[MCP startup warning] {exc}", file=sys.stderr)
         print(f"[Orchestrator] Build: {ORCHESTRATOR_BUILD}", file=sys.stderr)
+        print(f"[Renderer] Build: {FRIENDLY_RENDERER_BUILD}", file=sys.stderr)
         print(f"[Orchestrator] Enterprise tools: {self.tool_names}", file=sys.stderr)
         print(f"[Runtime] orchestrator_file={__file__}", file=sys.stderr)
+        import core.response_renderer as _response_renderer_module
+        print(f"[Runtime] response_renderer_file={getattr(_response_renderer_module, '__file__', '')}", file=sys.stderr)
         import core.semantic_parser as _semantic_parser_module
         print(f"[Runtime] semantic_parser_file={getattr(_semantic_parser_module, '__file__', '')}", file=sys.stderr)
         print(f"[Runtime] semantic_parser_build={SEMANTIC_PARSER_BUILD}", file=sys.stderr)
@@ -3458,9 +5090,9 @@ class Orchestrator:
         result = await self._execute_tool("get_employee_profile", {}, context, target_username=context.username)
         if not result.get("success"):
             message = (
-                "أهلًا 👋\nأنا مساعدك الذكي في الهيئة، أساعدك في الوصول للمعلومات والخدمات اليومية بسهولة، مثل الإجازات والاجتماعات وغيرها.\nحاليًا أنا في المرحلة التجريبية 😊 كيف أقدر أساعدك اليوم؟"
+                "أهلًا وسهلًا 👋\nأنا سند، وحاليًا أنا في مرحلتي التجريبية 😊\nأقدر أساعدك في الوصول لخدمات ومعلومات الهيئة بسهولة، مثل الإجازات، الموظفين، الاجتماعات وغيرها.\nكيف أقدر أساعدك اليوم؟"
                 if language == "ar"
-                else "Hi 👋 I'm your AI assistant at RCRC. I can help you access everyday information and services, including leave and meetings. I'm currently in the experimental phase 😊 How can I help today?"
+                else "Hi 👋 I'm Sanad. I can help with RCRC services and information such as leave, employees, meetings, and more. I'm currently in my experimental phase 😊 How can I help today?"
             )
             return {"message": message, "name": ""}
         data = result.get("data") if isinstance(result.get("data"), dict) else {}
@@ -3477,18 +5109,18 @@ class Orchestrator:
                 file=sys.stderr,
             )
             message = (
-                "أهلًا 👋\nأنا مساعدك الذكي في الهيئة، أساعدك في الوصول للمعلومات والخدمات اليومية بسهولة، مثل الإجازات والاجتماعات وغيرها.\nحاليًا أنا في المرحلة التجريبية 😊 كيف أقدر أساعدك اليوم؟"
+                "أهلًا وسهلًا 👋\nأنا سند، وحاليًا أنا في مرحلتي التجريبية 😊\nأقدر أساعدك في الوصول لخدمات ومعلومات الهيئة بسهولة، مثل الإجازات، الموظفين، الاجتماعات وغيرها.\nكيف أقدر أساعدك اليوم؟"
                 if language == "ar"
-                else "Hi 👋 I'm your AI assistant at RCRC. I can help you access everyday information and services, including leave and meetings. I'm currently in the experimental phase 😊 How can I help today?"
+                else "Hi 👋 I'm Sanad. I can help with RCRC services and information such as leave, employees, meetings, and more. I'm currently in my experimental phase 😊 How can I help today?"
             )
             return {"message": message, "name": ""}
 
         full_name = _name(data, language) or _name(data, "ar") or context.username
         first_name = str(full_name).strip().split()[0] if str(full_name).strip() else context.username
         message = (
-            f"أهلًا {first_name} 👋\nأنا مساعدك الذكي في الهيئة، أساعدك في الوصول للمعلومات والخدمات اليومية بسهولة، مثل الإجازات والاجتماعات وغيرها.\nحاليًا أنا في المرحلة التجريبية 😊 كيف أقدر أساعدك اليوم؟"
+            f"أهلًا وسهلًا {first_name} 👋\nأنا سند، وحاليًا أنا في مرحلتي التجريبية 😊\nأقدر أساعدك في الوصول لخدمات ومعلومات الهيئة بسهولة، مثل الإجازات، الموظفين، الاجتماعات وغيرها.\nكيف أقدر أساعدك اليوم؟"
             if language == "ar"
-            else f"Hi {first_name} 👋 I'm your AI assistant at RCRC. I can help you access everyday information and services, including leave and meetings. I'm currently in the experimental phase 😊 How can I help today?"
+            else f"Hi {first_name} 👋 I'm Sanad. I can help with RCRC services and information such as leave, employees, meetings, and more. I'm currently in my experimental phase 😊 How can I help today?"
         )
         return {"message": message, "name": full_name}
 
@@ -3549,6 +5181,94 @@ class Orchestrator:
             print(f"[Writing Facts] {exc}", file=sys.stderr)
         return {k: v for k, v in facts.items() if v}
 
+    async def _email_draft_answer(
+        self,
+        message: str,
+        language: str,
+        verified_facts: dict[str, str] | None = None,
+    ) -> str:
+        """Dedicated drafting path. It never searches the employee directory."""
+        if _email_request_is_vague(message):
+            return (
+                "أكيد 😊 وش موضوع الإيميل ومين بترسله له؟ اكتب لي الفكرة حتى لو بكلمتين وأنا أصيغه لك."
+                if language == "ar"
+                else "Sure 😊 What is the email about, and who are you sending it to? Give me the idea and I’ll draft it for you."
+            )
+
+        system_prompt = """
+You are Sanad's email-writing mode. Draft the email requested by the user.
+Rules:
+- Do NOT search for enterprise data and do NOT invent names, emails, titles, dates, approvals, or facts.
+- You may use VERIFIED_FACTS only when supplied.
+- If the user gives rough wording, turn it into a polished email while preserving their meaning.
+- Match the requested language. For Arabic, use natural professional Arabic. For English, use natural professional English.
+- If the user asks for concise/short, keep it concise.
+- Return ONLY the ready-to-send email text. Include a subject only if useful or explicitly requested.
+- Do not explain what you did.
+""".strip()
+        payload = {
+            "CURRENT_LANGUAGE": language,
+            "CURRENT_MESSAGE": message,
+            "VERIFIED_FACTS": verified_facts or {},
+        }
+        try:
+            response = await asyncio.to_thread(chat, [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ])
+            answer = str(((response.get("message") or {}).get("content") if isinstance(response, dict) else "") or "").strip()
+        except Exception as exc:
+            print(f"[Email Draft Error] {exc}", file=sys.stderr)
+            answer = ""
+
+        if answer and _language_is_valid(answer, language):
+            return answer
+        return (
+            "أكيد 😊 اكتب لي باختصار وش تبغى تقول في الإيميل ومين المستلم، وأنا أصيغه لك بشكل مرتب."
+            if language == "ar"
+            else "Sure 😊 Tell me briefly what you want the email to say and who it is for, and I’ll draft it."
+        )
+
+    async def _email_followup_answer(
+        self,
+        instruction: str,
+        draft: str,
+        target_language: str,
+    ) -> str:
+        """Revise/translate the last email draft without invoking enterprise search."""
+        system_prompt = """
+You are Sanad's email revision mode. The user is editing the LAST_EMAIL_DRAFT.
+Apply only the user's latest instruction to that same draft.
+Rules:
+- Preserve the original meaning and verified names/facts unless the user explicitly asks to remove/change wording.
+- Never invent new enterprise facts, names, emails, job titles, dates, approvals, or commitments.
+- If asked to make it more formal/professional, improve tone and wording without becoming overly verbose.
+- If asked to shorten it, preserve the key message.
+- If asked to translate, translate the entire ready-to-send email naturally.
+- Respect TARGET_LANGUAGE exactly: ar = Arabic, en = English.
+- If asked to change only one part (subject/opening/ending/paragraph), keep the rest substantially unchanged.
+- Return ONLY the revised ready-to-send email text. Do not explain the edits.
+""".strip()
+        payload = {
+            "TARGET_LANGUAGE": target_language,
+            "USER_INSTRUCTION": instruction,
+            "LAST_EMAIL_DRAFT": draft,
+        }
+        try:
+            response = await asyncio.to_thread(chat, [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ])
+            answer = str(((response.get("message") or {}).get("content") if isinstance(response, dict) else "") or "").strip()
+        except Exception as exc:
+            print(f"[Email Followup Error] {exc}", file=sys.stderr)
+            answer = ""
+
+        if answer and _language_is_valid(answer, target_language):
+            return answer
+        return draft
+
+
     async def _general_answer(
         self,
         message: str,
@@ -3600,7 +5320,11 @@ class Orchestrator:
                 f"msg={message[:80]!r}",
                 file=sys.stderr,
             )
-            answer = enterprise_clarification(language)
+            answer = (
+                "آسف 😅 أنا لسه بمرحلتي التجريبية وما فهمت طلبك هالمرة. ممكن توضحه لي شوي؟"
+                if language == "ar"
+                else "Sorry 😅 I'm still in my experimental phase and I didn't understand that request this time. Could you rephrase it a little?"
+            )
             blocked = True
 
         # Qwen occasionally leaks a different language. Repair once, then fall back safely.
@@ -3620,7 +5344,7 @@ class Orchestrator:
 
         if not answer:
             answer = (
-                "حقك علي 😅 شكلي ما التقطت قصدك صح. خلني أكمل معك من نفس السياق—قولها بطريقتك وأنا أضبطها."
+                "هههه حقك علي 😅"
                 if language == "ar"
                 else "I'm currently in my experimental phase 😊 I couldn't prepare a good response to that request just now. Try phrasing it another way and I'll try again."
             )
@@ -3632,7 +5356,7 @@ class Orchestrator:
 
     async def _web_answer(self, message: str, language: str) -> tuple[str, list[str]]:
         if not getattr(settings, "enable_web_search", False) or "web_search" not in self._mcp_tool_names:
-            return ("البحث في الويب غير متاح حاليًا." if language == "ar" else "Web search is currently unavailable."), []
+            return ("البحث الخارجي مو متاح عندي حاليًا 😊" if language == "ar" else "Web search is currently unavailable."), []
         plan = {"query": message, "topic": "general", "max_results": 5, "search_depth": "basic", "days": None}
         try:
             response = await asyncio.to_thread(chat, [
@@ -3657,10 +5381,10 @@ class Orchestrator:
         except Exception:
             data = None
         if not isinstance(data, dict) or data.get("success") is not True:
-            return ("ما قدرت أوصل لنتائج الويب حاليًا." if language == "ar" else "I couldn't retrieve web results right now."), []
+            return ("ما قدرت أوصل لنتائج البحث الخارجي هالمرة 😅" if language == "ar" else "I couldn't retrieve web results right now."), []
         results = [x for x in (data.get("results") or []) if isinstance(x, dict)][:8]
         if not results:
-            return ("ما لقيت نتائج مناسبة في الويب." if language == "ar" else "I couldn't find relevant web results."), []
+            return ("ما لقيت نتيجة مناسبة لطلبك في البحث الخارجي." if language == "ar" else "I couldn't find relevant web results."), []
         sources = [str(x.get("url") or "").strip() for x in results if str(x.get("url") or "").strip()]
         try:
             response = await asyncio.to_thread(chat, [
@@ -3679,9 +5403,114 @@ class Orchestrator:
             answer = "\n".join(lines)
         return answer, list(dict.fromkeys(sources))
 
+    @staticmethod
+    def _smart_cache_ttl(tool_name: str, default_ttl: int) -> int:
+        """
+        Global enterprise cache policy.
+
+        Every read-only API/tool is cached. Known tools receive a tuned TTL;
+        future/unknown read tools automatically receive a safe 60-second TTL.
+
+        Mutation tools are NEVER cached. This protects future actions such as
+        create/update/delete/submit/approve/reject/cancel/send.
+        """
+        tool = str(tool_name or "").strip()
+        tool_cf = tool.casefold()
+
+        # Never cache mutations/actions.
+        mutation_markers = (
+            "create", "update", "delete", "remove", "submit", "approve",
+            "reject", "cancel", "send", "post", "put", "patch", "set_",
+            "add_", "upload", "save_", "execute_", "request_",
+        )
+        if any(marker in tool_cf for marker in mutation_markers):
+            return 0
+
+        ttl_by_tool = {
+            # Meetings / calendar
+            "get_meeting_list": 60,
+            "get_my_meetings": 60,
+
+            # Attendance / working hours
+            "get_today_attendance": 20,
+            "get_employee_attendance": 30,
+            "get_subemployees_attendance": 30,
+            "get_working_hours": 30,
+
+            # Leave / vacation
+            "get_leave_balance": 120,
+            "get_vacation_history": 180,
+            "get_vacations_list": 180,
+            "get_intersected_vacations": 120,
+
+            # Employee directory / organization
+            "get_employee_profile": 300,
+            "get_employee_details": 300,
+            "get_manager_details": 300,
+            "get_reporting_employees": 300,
+            "search_employees": 300,
+            "get_employee_image": 600,
+
+            # Policies / content
+            "search_policies": 1800,
+            "get_policy_details": 1800,
+            "get_news_list": 300,
+            "get_news_details": 600,
+            "get_announcements_list": 300,
+            "get_announcement_details": 600,
+            "get_mazaya_list": 600,
+            "get_mazaya_details": 900,
+
+            # Tarasol / operational transactions
+            "get_tarasol_count": 30,
+            "get_tarasol_transactions": 30,
+        }
+
+        selected = ttl_by_tool.get(tool)
+        if selected is not None:
+            return selected
+
+        # Global fallback: cache all unknown/future read-only APIs too.
+        try:
+            configured = int(default_ttl)
+        except Exception:
+            configured = 0
+
+        return configured if configured > 0 else 60
+
+
+    @staticmethod
+    def _cache_log_scope(arguments: dict[str, Any]) -> str:
+        """Small, non-sensitive cache scope for logs."""
+        args = arguments if isinstance(arguments, dict) else {}
+        parts: list[str] = []
+
+        for key in ("period", "start_date", "end_date", "time_query"):
+            value = str(args.get(key) or "").strip()
+            if value:
+                parts.append(f"{key}={value!r}")
+
+        # Search text is useful for content/directory cache debugging, but keep
+        # it short and never log tokens/credentials.
+        search = str(args.get("search") or "").strip()
+        if search:
+            clean = search.replace("\n", " ")[:60]
+            parts.append(f"search={clean!r}")
+
+        return " ".join(parts)
+
+
     async def _execute_tool(self, tool_name: str, arguments: dict[str, Any], context: EmployeeContext, target_username: str | None = None) -> dict[str, Any]:
         target = str(target_username or context.username or "").strip()
-        ttl = self.cache.ttl_for(tool_name)
+        default_ttl = self.cache.ttl_for(tool_name)
+        ttl = self._smart_cache_ttl(tool_name, default_ttl)
+        cache_scope = self._cache_log_scope(arguments or {})
+        if ttl <= 0:
+            print(
+                f"[Tool Cache BYPASS] tool={tool_name!r} reason='mutation_or_disabled' "
+                f"{cache_scope}".rstrip(),
+                file=sys.stderr,
+            )
         # Scope cache entries to the authenticated token without storing the
         # token itself.  This is critical in the POC because context.username
         # can be a shared/dev placeholder (for example rcuser) while different
@@ -3699,7 +5528,11 @@ class Orchestrator:
         if ttl > 0:
             cached = self.cache.get(cache_key)
             if cached is not None:
-                print(f"[Tool Cache HIT] tool={tool_name!r} target={target!r}", file=sys.stderr)
+                print(
+                    f"[Tool Cache HIT] source='cache' tool={tool_name!r} target={target!r} "
+                    f"ttl={ttl} {cache_scope}".rstrip(),
+                    file=sys.stderr,
+                )
                 return {"success": True, "data": cached, "cached": True}
 
         try:
@@ -3712,26 +5545,108 @@ class Orchestrator:
             )
             if ttl > 0:
                 self.cache.set(cache_key, data, ttl)
-                print(f"[Tool Cache SET] tool={tool_name!r} target={target!r} ttl={ttl}", file=sys.stderr)
+                print(
+                    f"[Tool Cache SET] tool={tool_name!r} target={target!r} "
+                    f"ttl={ttl} {cache_scope}".rstrip(),
+                    file=sys.stderr,
+                )
             return {"success": True, "data": data}
         except EmployeeAuthenticationError:
             return {"success": False, "error_type": "auth", "error": "authentication"}
         except EmployeeAuthorizationError:
             return {"success": False, "error_type": "authorization", "error": "authorization"}
         except EmployeeAPIError as exc:
+            print(
+                f"[Tool API error] tool={tool_name!r} target={target!r} error={exc}",
+                file=sys.stderr,
+            )
             return {"success": False, "error_type": "api", "error": str(exc)}
         except Exception as exc:
             print(f"[Tool unexpected error] {tool_name}: {exc}", file=sys.stderr)
             return {"success": False, "error_type": "unexpected", "error": str(exc)}
 
     @staticmethod
-    def _tool_error(result: dict[str, Any], language: str) -> str:
-        kind = result.get("error_type")
+    def _tool_error(
+        result: dict[str, Any],
+        language: str,
+        *,
+        intent: str = "",
+    ) -> str:
+        """Return a short, human error without exposing backend details.
+
+        Keep authentication/authorization explicit, but make ordinary service
+        failures specific to the user's active task. The experimental-phase
+        sentence is intentionally not repeated on every transient failure.
+        """
+        kind = str(result.get("error_type") or "")
+
         if kind == "auth":
-            return "انتهت صلاحية الدخول. سجّل الدخول من جديد." if language == "ar" else "Your sign-in session has expired. Please sign in again."
+            return (
+                "يبدو إن جلسة الدخول انتهت. سجّل الدخول مرة ثانية وجربني."
+                if language == "ar"
+                else "Your session seems to have expired. Please sign in again and try once more."
+            )
+
         if kind == "authorization":
-            return "ما عندك صلاحية للوصول لهذي المعلومة." if language == "ar" else "You don't have permission to access that information."
-        return ("ما قدرت أوصل للمعلومة الحين. جرّب بعد شوي، وإذا استمرت المشكلة نقدر نحدد أي خدمة اللي وقفت." if language == "ar" else "I couldn't reach that information right now. Try again shortly; if it continues, we can narrow down which service is failing.")
+            employee_private_intents = {
+                "employee_details",
+                "attendance_today",
+                "attendance_history",
+                "working_hours",
+                "leave_balance",
+                "leave_history",
+                "vacations_list",
+                "team_attendance",
+                "reporting_employees",
+            }
+
+            if intent in employee_private_intents:
+                return (
+                    "بعض معلومات الموظفين تكون غير متاحة حفاظًا على الخصوصية 😊\n"
+                    "لكن أقدر أساعدك بالمعلومات المتاحة عن الموظف."
+                    if language == "ar"
+                    else
+                    "Some employee information isn’t available due to privacy restrictions 😊\n"
+                    "But I can still help with the details that are available."
+                )
+
+            return (
+                "هذي المعلومة مو متاحة لك حسب صلاحيات الوصول الحالية."
+                if language == "ar"
+                else "This information isn’t available with your current access permissions."
+            )
+
+        if language != "ar":
+            english = {
+                "employee_details": "I couldn't retrieve the employee details right now. Please try again.",
+                "manager": "I couldn't retrieve the manager details right now. Please try again.",
+                "attendance_today": "I couldn't retrieve today's attendance right now. Please try again.",
+                "attendance_history": "I couldn't retrieve the attendance history right now. Please try again.",
+                "working_hours": "I couldn't retrieve the working hours right now. Please try again.",
+                "meetings": "I couldn't retrieve the meetings right now. Please try again.",
+                "meeting_list": "I couldn't retrieve the meetings right now. Please try again.",
+                "leave_balance": "I couldn't retrieve the leave balance right now. Please try again.",
+                "leave_history": "I couldn't retrieve the leave history right now. Please try again.",
+                "tarasol_count": "I couldn't retrieve your Tarasol transactions right now. Please try again.",
+                "tarasol_details": "I couldn't retrieve the Tarasol details right now. Please try again.",
+            }
+            return english.get(intent, "I couldn't retrieve that information right now. Please try again.")
+
+        arabic = {
+            "employee_details": "ما قدرت أوصل لمعلومات الموظف حاليًا. جرّبني مرة ثانية.",
+            "profile": "ما قدرت أجيب معلوماتك حاليًا. جرّبني مرة ثانية.",
+            "manager": "ما قدرت أجيب معلومات المدير حاليًا. جرّبني مرة ثانية.",
+            "attendance_today": "ما قدرت أجيب بيانات حضورك اليوم حاليًا. جرّبني مرة ثانية.",
+            "attendance_history": "ما قدرت أجيب سجل حضورك حاليًا. جرّبني مرة ثانية.",
+            "working_hours": "ما قدرت أجيب ساعات دوامك حاليًا. جرّبني مرة ثانية.",
+            "meetings": "ما قدرت أجيب اجتماعاتك حاليًا. جرّبني مرة ثانية.",
+            "meeting_list": "ما قدرت أجيب اجتماعاتك حاليًا. جرّبني مرة ثانية.",
+            "leave_balance": "ما قدرت أجيب رصيد إجازاتك حاليًا. جرّبني مرة ثانية.",
+            "leave_history": "ما قدرت أجيب سجل إجازاتك حاليًا. جرّبني مرة ثانية.",
+            "tarasol_count": "ما قدرت أوصل لمعاملات تراسل حاليًا. جرّبني مرة ثانية.",
+            "tarasol_details": "ما قدرت أجيب تفاصيل معاملات تراسل حاليًا. جرّبني مرة ثانية.",
+        }
+        return arabic.get(intent, "صار عندي تعثر بسيط وما قدرت أجيب المعلومة حاليًا. جرّبني مرة ثانية.")
 
     def _tool_args(self, request: ParsedRequest, language: str) -> dict[str, Any]:
         args: dict[str, Any] = {}
@@ -3748,30 +5663,189 @@ class Orchestrator:
         if request.intent == "employee_role_search":
             args["role_query"] = request.role_query
         if request.intent == "policy_search":
-            args.update({"search": request.query, "start_index": 0, "batch_size": 10})
+            # Generic policy/procedure requests must list available policies, not
+            # search literally for filler such as "والاجراءات". Keep a search
+            # term only when the user actually named a specific policy/topic.
+            policy_search = str(request.query or "").strip()
+            normalized_policy_search = re.sub(
+                r"[؟?!.،,]+", " ", policy_search.casefold()
+            )
+            normalized_policy_search = " ".join(normalized_policy_search.split())
+            generic_policy_only = re.fullmatch(
+                r"(?:(?:و|and|&)?\s*(?:ال)?(?:سياس(?:ه|ة|ات)|اجراء(?:ات)?|إجراء(?:ات)?|policy|policies|procedure|procedures)\s*)+",
+                normalized_policy_search,
+                re.I,
+            )
+            if (
+                not normalized_policy_search
+                or generic_policy_only
+                or _is_generic_policy_request(policy_search)
+            ):
+                policy_search = ""
+            args.update({"search": policy_search, "start_index": 0, "batch_size": 10})
         if request.intent == "news":
-            args.update({"search": request.query, "start_index": 0, "batch_size": 5})
+            # Generic news-list requests must not be sent upstream as literal
+            # search text (e.g. "اخر اخبار الهيئة"), otherwise the API may
+            # return zero rows while the user simply asked for the latest list.
+            news_search = str(request.query or "").strip()
+            generic_news = re.sub(r"[؟?!.،,]+", " ", news_search.casefold())
+            generic_news = " ".join(generic_news.split())
+            if (
+                not generic_news
+                or re.fullmatch(
+                    r"(?:اخر|آخر|احدث|أحدث|ابرز|أبرز|اهم|أهم|latest|recent|top|highlights?)?\s*(?:ال)?(?:اخبار|أخبار|news)(?:\s+(?:ال)?(?:هيئه|هيئة|rcrc))?",
+                    generic_news,
+                    re.I,
+                )
+                or generic_news in {
+                    "وش اخبار الهيئة", "وش أخبار الهيئة", "وش الاخبار", "وش الأخبار",
+                    "اخبار الهيئة", "أخبار الهيئة", "ابرز اخبار الهيئة", "أبرز أخبار الهيئة", "اهم اخبار الهيئة", "أهم أخبار الهيئة", "الاخبار", "الأخبار",
+                }
+            ):
+                news_search = ""
+            args.update({"search": news_search, "start_index": 0, "batch_size": 5})
         if request.intent == "announcements":
-            args.update({"search": request.query, "start_index": 0, "batch_size": 10})
+            # A general request for the latest Tawasul announcements is a LIST,
+            # not a literal keyword search. Pass an empty search to the API.
+            # Preserve explicitly named topics for genuine filtered searches.
+            announcement_search = str(request.query or "").strip()
+            normalized_announcement = announcement_search.casefold()
+            normalized_announcement = re.sub(r"[\u064b-\u065f\u0670]", "", normalized_announcement)
+            normalized_announcement = re.sub(r"[إأآٱ]", "ا", normalized_announcement)
+            normalized_announcement = re.sub(r"[؟?!.،,:\-]+", " ", normalized_announcement)
+            normalized_announcement = " ".join(normalized_announcement.split())
+            generic_announcement = re.fullmatch(
+                r"(?:(?:ابي|ابغى|اريد|اعرض|ورني|هات|عطني|اعطني|وش|ايش|show|list|give|me|the|please)\s+)*"
+                r"(?:(?:اخر|احدث|ابرز|اهم|جميع|كل|latest|recent|top|all|current|new)\s+)*"
+                r"(?:(?:ال)?(?:اعلان|اعلانات|تعميم|تعاميم|announcement|announcements|circular|circulars))"
+                r"(?:\s+(?:(?:ال)?(?:هيئه|هيئة|تواصل|tawasul|rcrc)))?",
+                normalized_announcement,
+                re.I,
+            )
+            if not normalized_announcement or generic_announcement:
+                announcement_search = ""
+            args.update({"search": announcement_search, "start_index": 0, "batch_size": 10})
         if request.intent == "mazaya":
             args.update({"search": request.query, "start_index": 0, "batch_size": 10})
         return args
 
     async def _resolve_detail_item(self, request: ParsedRequest, state: dict[str, Any], context: EmployeeContext, language: str) -> tuple[dict[str, Any] | None, str]:
-        row = _choose_content_item(request, state)
+        # A request for "full details" is locked to the last VERIFIED content item.
+        # It never goes back through employee/person resolution.
+        if str(request.query or "") == "content:full":
+            focus = state.get("content_focus") if isinstance(state.get("content_focus"), dict) else {}
+            row = None
+            if str(focus.get("detail_intent") or "") == request.intent:
+                full_data = focus.get("full_data")
+                if isinstance(full_data, dict) and full_data:
+                    return full_data, ""
+                focused_row = focus.get("row") if isinstance(focus.get("row"), dict) else None
+                if focused_row is not None:
+                    row = focused_row
+
+            # Fallback to persistent selection stored in list_state.
+            if row is None:
+                list_state = state.get("list_state") if isinstance(state.get("list_state"), dict) else {}
+                if str(list_state.get("selected_detail_intent") or "") == request.intent:
+                    selected_full = list_state.get("selected_full_data")
+                    if isinstance(selected_full, dict) and selected_full:
+                        return selected_full, ""
+                    selected_row = list_state.get("selected_item")
+                    if isinstance(selected_row, dict):
+                        row = selected_row
+                    else:
+                        items = [x for x in (list_state.get("items") or []) if isinstance(x, dict)]
+                        selected_index = int(list_state.get("selected_index") or 0)
+                        if 1 <= selected_index <= len(items):
+                            row = items[selected_index - 1]
+        else:
+            row = _choose_content_item(request, state)
+
+        # v185: an explicit noun + ordinal is independent from stale list_state.
+        # Example: after reading news, "ابي تفاصيل اول ميزه" must open the first
+        # Mazaya item, not the first news item. If the matching verified list is
+        # not already in state, fetch that list first and then resolve ordinal.
+        if row is None and request.ordinal > 0:
+            base_intent = DETAIL_BASE_INTENT.get(request.intent)
+            base_tools = {
+                "news": "get_news_list",
+                "announcements": "get_announcements_list",
+                "mazaya": "get_mazaya_list",
+                "policy_search": "search_policies",
+            }
+            base_tool = base_tools.get(str(base_intent or ""))
+            if base_tool:
+                list_args: dict[str, Any] = {"start_index": 0, "batch_size": 10}
+                if base_intent in {"news", "announcements", "mazaya", "policy_search"}:
+                    list_args["search"] = ""
+                list_result = await self._execute_tool(base_tool, list_args, context)
+                if list_result.get("success") and isinstance(list_result.get("data"), dict):
+                    list_data = list_result["data"]
+                    rows = _content_rows(list_data)
+                    state["list_state"] = {
+                        "intent": base_intent,
+                        "items": rows[:50],
+                        "query": "",
+                    }
+                    row = _choose_content_item(request, state)
+                    print(
+                        f"[Detail List Refresh] base={base_intent!r} ordinal={request.ordinal} rows={len(rows)}",
+                        file=sys.stderr,
+                    )
+
         if row is None:
-            return None, ("تقصد أي عنصر؟" if language == "ar" else "Which item do you mean?")
+            # Keep the exact content-detail request pending so a reply such as
+            # "5" can ONLY select from this verified content list.
+            state["pending"] = {
+                "kind": "content_detail_selection",
+                "query": "",
+                "candidates": [],
+                "request": request.model_dump(),
+                "message": "content_detail_selection",
+            }
+            return None, ("أكيد 😊 أي عنصر تقصد؟" if language == "ar" else "Which item do you mean?")
         item_id = _content_item_id(row)
         if not item_id:
+            state["content_focus"] = {
+                "detail_intent": request.intent,
+                "base_intent": DETAIL_BASE_INTENT.get(request.intent, ""),
+                "item_id": "",
+                "ordinal": int(request.ordinal or 0),
+                "row": row,
+                "full_data": row,
+            }
+            _ls = state.get("list_state") if isinstance(state.get("list_state"), dict) else {}
+            _ls["selected_detail_intent"] = request.intent
+            _ls["selected_index"] = int(request.ordinal or 0)
+            _ls["selected_item"] = row
+            _ls["selected_full_data"] = row
+            state["list_state"] = _ls
+            state["pending"] = {"kind": "", "query": "", "candidates": [], "request": {}, "message": ""}
             return row, ""
         policy = get_policy(request.intent)
         if policy is None:
-            return None, ("تعذر تحديد نوع التفاصيل." if language == "ar" else "I couldn't determine the detail type.")
+            return None, ("ما قدرت أحدد أي تفاصيل تقصد. وضّح لي وش تبغى بالضبط 😊" if language == "ar" else "I couldn't determine the detail type.")
         result = await self._execute_tool(policy.tool_name, {"item_id": item_id}, context)
         if not result.get("success"):
             return None, self._tool_error(result, language)
         data = result.get("data")
-        return (data if isinstance(data, dict) else row), ""
+        resolved_data = data if isinstance(data, dict) else row
+        state["content_focus"] = {
+            "detail_intent": request.intent,
+            "base_intent": DETAIL_BASE_INTENT.get(request.intent, ""),
+            "item_id": item_id,
+            "ordinal": int(request.ordinal or 0),
+            "row": row,
+            "full_data": resolved_data if isinstance(resolved_data, dict) else row,
+        }
+        _ls = state.get("list_state") if isinstance(state.get("list_state"), dict) else {}
+        _ls["selected_detail_intent"] = request.intent
+        _ls["selected_index"] = int(request.ordinal or 0)
+        _ls["selected_item"] = row
+        _ls["selected_full_data"] = resolved_data if isinstance(resolved_data, dict) else row
+        state["list_state"] = _ls
+        state["pending"] = {"kind": "", "query": "", "candidates": [], "request": {}, "message": ""}
+        return resolved_data, ""
 
     @staticmethod
     def _mazaya_row_needs_details(row: dict[str, Any]) -> bool:
@@ -3912,11 +5986,11 @@ class Orchestrator:
             else:
                 result = await self._execute_tool("get_manager_details", {}, context, target_username=username)
                 if not result.get("success"):
-                    return self._tool_error(result, language), None
+                    return self._tool_error(result, language, intent=request.intent), None
                 final = result.get("data") if isinstance(result.get("data"), dict) else {}
             username = _uid(final)
             if not username and hop < request.relation_depth - 1:
-                return ("تعذر متابعة التسلسل الإداري من النظام." if language == "ar" else "I couldn't continue the management chain from the system."), None
+                return ("آسف 😅 ما قدرت أتحقق من التسلسل الإداري هالمرة، فما راح أعطيك معلومة غير مؤكدة." if language == "ar" else "I couldn't continue the management chain from the system."), None
 
         final = _bounded_employee(final or {})
         requested_manager_fields = [f for f in request.fields if f not in {"all", "name"}]
@@ -3956,6 +6030,42 @@ class Orchestrator:
         subject_username = context.username if self_subject else target.username
         subject_name = _name(target.employee, language) if target.employee else ""
 
+        # ReportingEmployees accepts username only. For self requests,
+        # resolve the authenticated user's real userid from myProfile first.
+        # This keeps the flow multi-user and avoids using dev aliases such as
+        # "rcuser" or employee codes.
+        if self_subject:
+            try:
+                profile_data = await self.employee_api.get_my_profile_row(
+                    username=context.username,
+                    access_token=context.access_token,
+                )
+            except (EmployeeAuthenticationError, EmployeeAuthorizationError, EmployeeAPIError) as exc:
+                print(f"[Reporting Self Profile] error: {exc}", file=sys.stderr)
+                profile_data = {}
+
+            if isinstance(profile_data, dict):
+                verified_username = str(
+                    profile_data.get("userid")
+                    or profile_data.get("username")
+                    or profile_data.get("userName")
+                    or ""
+                ).strip()
+                if verified_username:
+                    subject_username = verified_username
+                if not subject_name:
+                    subject_name = str(
+                        profile_data.get("namea")
+                        or profile_data.get("namel")
+                        or ""
+                    ).strip()
+
+            print(
+                f"[Reporting Self Identity] "
+                f"context={context.username!r} verified={subject_username!r}",
+                file=sys.stderr,
+            )
+
         try:
             result = await self.employee_api.get_reporting_employees(
                 username=subject_username,
@@ -3968,9 +6078,9 @@ class Orchestrator:
         except EmployeeAPIError as exc:
             print(f"[Reporting] error subject={subject_username!r}: {exc}", file=sys.stderr)
             return (
-                "آسف 😅 ما قدرت أقرأ قائمة الموظفين التابعين من النظام هالمرة. وأنا لسه في مرحلتي التجريبية، وقاعد أتعلم وأتطور باستمرار."
+                "ما قدرت أوصل لقائمة فريقك حاليًا 😅 وأنا حاليًا في مرحلتي التجريبية، وقاعد أتعلم وأتطور باستمرار 😊"
                 if language == "ar"
-                else "Sorry, I couldn't read the direct-reports list from the system this time."
+                else "I couldn't reach your team list right now. Please try again later."
             ), None
 
         raw_rows = [row for row in (result.get("employees") or []) if isinstance(row, dict)]
@@ -4076,21 +6186,99 @@ class Orchestrator:
         if request.intent == "manager":
             return await self._execute_manager_chain(request, target, context, language, state)
 
+        # Manager follow-up shortcut.
+        # After a successful "مين مديري؟", the verified manager object is already
+        # stored in relation/focus state and get_manager_details already returns
+        # public contact fields (email/mobile/extension) when available.
+        # For a natural follow-up such as "ابي ايميله ورقم جواله", use that
+        # verified manager object directly instead of forcing a new employee
+        # directory lookup. Missing fields are rendered as unavailable rather
+        # than turning the whole answer into a directory-service error.
+        if request.intent == "employee_details" and target.employee:
+            relation_state = state.get("relation") if isinstance(state.get("relation"), dict) else {}
+            relation_object = (
+                relation_state.get("object")
+                if isinstance(relation_state.get("object"), dict)
+                else {}
+            )
+            same_as_manager = bool(
+                str(relation_state.get("predicate") or "") == "manager"
+                and _uid(relation_object)
+                and _uid(target.employee)
+                and _uid(relation_object).casefold() == _uid(target.employee).casefold()
+            )
+            public_manager_fields = {
+                "name", "name_en", "job_title", "job_title_en",
+                "department", "department_en", "sector", "sector_en",
+                "email", "mobile", "extension", "username",
+            }
+            requested = {str(field) for field in (request.fields or []) if str(field) != "all"}
+            if same_as_manager and requested and requested.issubset(public_manager_fields):
+                data = _merge_employee(relation_object, target.employee)
+                manager_name = _name(data, language) or subject_name
+                answer = render_profile(
+                    data,
+                    request,
+                    language,
+                    subject_name=manager_name,
+                    self_subject=False,
+                )
+                _remember_entity(state, data, set_focus=True)
+                _set_employee_more_details_pending(state, request, self_subject=False)
+                print(
+                    f"[Manager Follow-up] used verified relation object "
+                    f"username={_uid(data)!r} fields={request.fields!r}",
+                    file=sys.stderr,
+                )
+                return answer, data
+
+        # A numbered employee choice requires a fresh full-details API call.
+        selected_from_department = (
+            request.intent == "employee_details"
+            and request.query == "employee:selected_from_department_list"
+        )
+        if selected_from_department and target.username:
+            selected = state.get("selected_list_employee") or {}
+            selected_code = str(selected.get("emp_code") or "").strip()
+            if selected_code:
+                self.employee_api.remember_employee_code(target.username, selected_code)
+
         # If a verified resolver row already contains every requested profile field,
         # do not make a second API call just to re-fetch the same facts.
-        if request.intent == "employee_details" and target.employee and _verified_row_satisfies(target.employee, request.fields, language):
+        if request.intent == "employee_details" and not selected_from_department and target.employee and _verified_row_satisfies(target.employee, request.fields, language):
             data = target.employee
             answer = render_profile(data, request, language, subject_name=subject_name, self_subject=False)
             _remember_entity(state, data, set_focus=True)
+            _set_employee_more_details_pending(state, request, self_subject=False)
             return answer, data
 
-        result = await self._execute_tool(policy.tool_name, self._tool_args(request, language), context, target_username=target.username)
+        # Meetings are date-range queries in the deployed RCRC API.
+        # Always use MeetingList/myMeetings so startDate/endDate return every
+        # meeting in the requested period, including historical meetings.
+        execution_tool = policy.tool_name
+        if request.intent in {"meetings", "meeting_list"} and self_subject:
+            execution_tool = "get_meeting_list"
+            print(
+                "[Meeting API Route] "
+                f"intent={request.intent!r} "
+                f"tool='get_meeting_list' "
+                f"start={request.start_date!r} "
+                f"end={request.end_date!r}",
+                file=sys.stderr,
+            )
+
+        result = await self._execute_tool(
+            execution_tool,
+            self._tool_args(request, language),
+            context,
+            target_username=target.username,
+        )
         if not result.get("success"):
-            # IntersectedVacations is currently absent in the deployed API and
-            # returns HTTP 404 even from Postman. Report that accurately.
+            # An HTTP 404 from this environment is a real request failure;
+            # never treat it as successful verification of no overlap.
             if request.intent == "leave_overlap" and "404" in str(result.get("error") or ""):
                 return (
-                    "تعذر التحقق من تداخل الإجازات حاليًا لأن خدمة التحقق غير متاحة في النظام."
+                    "آسف 😅 ما قدرت أتحقق من تداخل الإجازات هالمرة."
                     if language == "ar"
                     else "I can't check overlapping leave right now because the overlap service is unavailable."
                 ), None
@@ -4099,11 +6287,18 @@ class Orchestrator:
             if request.intent == "employee_details" and target.employee and _verified_row_satisfies(target.employee, request.fields, language):
                 data = target.employee
             else:
-                return self._tool_error(result, language), None
+                return self._tool_error(result, language, intent=request.intent), None
         else:
             data = result.get("data")
 
         data = data if isinstance(data, dict) else {}
+
+        if request.intent == "leave_overlap":
+            return render_leave_overlap(
+                data, language,
+                start_date=request.start_date,
+                end_date=request.end_date,
+            ), data
 
         if request.intent == "employee_image":
             image_data_url = str(data.get("image_data_url") or "").strip()
@@ -4112,7 +6307,7 @@ class Orchestrator:
                 # renders a safe <img> card instead of dumping Base64 text.
                 return f"[EMPLOYEE_IMAGE_DATA]{image_data_url}", data
             return (
-                "الصورة الوظيفية غير متاحة حاليًا."
+                "الصورة الوظيفية ما ظهرت لي حاليًا."
                 if language == "ar"
                 else "Your employee profile image is not available right now."
             ), data
@@ -4198,16 +6393,62 @@ class Orchestrator:
             )
             if not self_subject:
                 _remember_entity(state, render_data, set_focus=(target.kind != "relation_object"))
+                _set_employee_more_details_pending(state, request, self_subject=False)
             return answer, render_data
 
         if request.intent == "leave_balance":
+            # v239: hypothetical leave follow-ups must calculate from the exact
+            # balance that was just shown to the signed-in user.
+            #
+            # Example:
+            #   "كم رصيد إجازاتي؟" -> 3 days
+            #   "لو خذت يوم كم يبقى لي" -> 2 days
+            #
+            # Do not accidentally switch to annual entitlement (e.g. 30 days)
+            # and do not mutate the real balance: this is display-only context.
+            render_data = data
+
+            leave_ctx = state.get("leave_context") if isinstance(state.get("leave_context"), dict) else {}
+            saved_balance = leave_ctx.get("displayed_balance")
+
+            if (
+                request.operation == "calculate"
+                and self_subject
+                and saved_balance is not None
+            ):
+                render_data = {"balance": saved_balance}
+                print(
+                    f"[Leave Followup Context] using_displayed_balance={saved_balance!r} "
+                    f"amount={request.amount!r}",
+                    file=sys.stderr,
+                )
+
             answer = render_leave_balance(
-                data,
+                render_data,
                 language,
                 subject_name=subject_name,
                 self_subject=self_subject,
                 amount=request.amount if request.operation == "calculate" else None,
             )
+
+            # Save the balance only after a normal lookup. A hypothetical
+            # calculation never changes this stored real/current balance.
+            if (
+                request.operation != "calculate"
+                and self_subject
+                and isinstance(data, dict)
+            ):
+                displayed_balance = data.get("balance")
+                if displayed_balance is not None and str(displayed_balance).strip() != "":
+                    state["leave_context"] = {
+                        "displayed_balance": displayed_balance,
+                        "source": "leave_balance_lookup",
+                    }
+                    print(
+                        f"[Leave Balance Context Saved] balance={displayed_balance!r}",
+                        file=sys.stderr,
+                    )
+
             if str(request.query or "") == "leave:compare_manager_private":
                 if language == "ar":
                     answer = answer.rstrip(".") + ". ما أقدر أقارنه برصيد مديرك لأن رصيد إجازاته من البيانات الخاصة به."
@@ -4259,9 +6500,164 @@ class Orchestrator:
                     "mode": str(request.query or "busy"),
                 }
         elif request.intent in {"meetings", "meeting_list"}:
+            # Historical self-meetings:
+            # Calendar/myMeetingBasicInfo may return an empty list for past dates
+            # even when MeetingList/myMeetings contains the verified meetings.
+            # For yesterday / explicit past dates, prefer the rich date-range
+            # MeetingList endpoint as the actual source, not only as link enrichment.
+            if self_subject and request.intent == "meetings":
+                try:
+                    today_local = datetime.now(
+                        timezone(timedelta(hours=3))
+                    ).date()
+                    requested_end = (
+                        datetime.fromisoformat(str(request.end_date)).date()
+                        if str(request.end_date or "").strip()
+                        else None
+                    )
+                    historical_request = bool(
+                        requested_end is not None and requested_end < today_local
+                    )
+
+                    current_rows = []
+                    if isinstance(data, dict):
+                        if isinstance(data.get("meetings"), list):
+                            current_rows = data.get("meetings") or []
+                        elif isinstance(data.get("records"), list):
+                            current_rows = data.get("records") or []
+
+                    if (historical_request or not current_rows) and execution_tool != "get_meeting_list":
+                        historical_result = await self._execute_tool(
+                            "get_meeting_list",
+                            {
+                                "start_date": request.start_date,
+                                "end_date": request.end_date,
+                            },
+                            context,
+                            target_username=target.username,
+                        )
+
+                        if historical_result.get("success"):
+                            historical_data = historical_result.get("data")
+                            historical_rows = (
+                                historical_data.get("records")
+                                if isinstance(historical_data, dict)
+                                and isinstance(historical_data.get("records"), list)
+                                else []
+                            )
+
+                            if historical_rows:
+                                data = {
+                                    "start_date": request.start_date,
+                                    "end_date": request.end_date,
+                                    "records": historical_rows,
+                                }
+                                print(
+                                    "[Historical Meetings] "
+                                    f"source='MeetingList/myMeetings' "
+                                    f"period={request.period!r} "
+                                    f"start={request.start_date!r} "
+                                    f"end={request.end_date!r} "
+                                    f"rows={len(historical_rows)}",
+                                    file=sys.stderr,
+                                )
+                            elif historical_request:
+                                print(
+                                    "[Historical Meetings] "
+                                    f"source='MeetingList/myMeetings' "
+                                    f"period={request.period!r} rows=0",
+                                    file=sys.stderr,
+                                )
+                except Exception as exc:
+                    # Preserve the existing basic-meeting result if the rich
+                    # historical lookup itself fails.
+                    print(
+                        f"[Historical Meetings Error] {exc}",
+                        file=sys.stderr,
+                    )
+
+            # myMeetingBasicInfo is reliable for title/time but some deployments
+            # omit the online join URL. Enrich the same verified meetings from
+            # the richer MeetingList endpoint before rendering.
+            if self_subject and request.intent == "meetings" and execution_tool != "get_meeting_list":
+                basic_rows = data.get("meetings") if isinstance(data.get("meetings"), list) else []
+                has_any_link = any(
+                    _first_value(
+                        row, "teams_link", "meeting_link", "meetingLink",
+                        "teamsLink", "TeamsLink", "joinUrl", "JoinUrl",
+                        "meetingUrl", "MeetingUrl", "onlineMeetingUrl",
+                        "OnlineMeetingUrl", "webLink", "WebLink", "url", "link",
+                    )
+                    for row in basic_rows if isinstance(row, dict)
+                )
+                if basic_rows and not has_any_link:
+                    try:
+                        rich_result = await self._execute_tool(
+                            "get_meeting_list",
+                            {
+                                "start_date": request.start_date,
+                                "end_date": request.end_date,
+                            },
+                            context,
+                            target_username=target.username,
+                        )
+                        rich_data = rich_result.get("data") if rich_result.get("success") else {}
+                        rich_rows = (
+                            rich_data.get("records")
+                            if isinstance(rich_data, dict) and isinstance(rich_data.get("records"), list)
+                            else []
+                        )
+
+                        def _meeting_subject_key(row: dict[str, Any]) -> str:
+                            return " ".join(_first_value(
+                                row, "subject", "Subject", "title", "Title",
+                                "meetingTitle", "MeetingTitle", "meetingName",
+                                "MeetingName", "subjectAr", "subjectEn",
+                            ).casefold().split())
+
+                        def _meeting_start_key(row: dict[str, Any]) -> str:
+                            raw = _first_value(row, "start_time", "startTime", "StartTime", "start")
+                            match = re.search(r"(?:T|\s)(\d{1,2}:\d{2})", raw)
+                            return match.group(1) if match else raw[-5:] if re.fullmatch(r"\d{1,2}:\d{2}", raw) else ""
+
+                        for base in basic_rows:
+                            if not isinstance(base, dict):
+                                continue
+                            b_subject = _meeting_subject_key(base)
+                            b_start = _meeting_start_key(base)
+                            candidates = [
+                                row for row in rich_rows
+                                if isinstance(row, dict) and _meeting_subject_key(row) == b_subject
+                            ]
+                            if b_start:
+                                exact = [row for row in candidates if _meeting_start_key(row) == b_start]
+                                if exact:
+                                    candidates = exact
+                            if len(candidates) == 1:
+                                rich_row = candidates[0]
+                                for key, value in rich_row.items():
+                                    if value not in (None, "", [], {}) and base.get(key) in (None, "", [], {}):
+                                        base[key] = value
+                                link = _first_value(
+                                    rich_row, "teams_link", "meeting_link", "meetingLink",
+                                    "teamsLink", "TeamsLink", "joinUrl", "JoinUrl",
+                                    "meetingUrl", "MeetingUrl", "onlineMeetingUrl",
+                                    "OnlineMeetingUrl", "webLink", "WebLink", "url", "link",
+                                )
+                                if link:
+                                    base["teams_link"] = link
+                                    print(
+                                        f"[Meeting Link Enrichment] subject={b_subject!r} link=True",
+                                        file=sys.stderr,
+                                    )
+                    except Exception as exc:
+                        print(f"[Meeting Link Enrichment Error] {exc}", file=sys.stderr)
+
             answer = render_meetings(
                 data, language, subject_name=subject_name, self_subject=self_subject,
                 period=request.period, start_date=request.start_date, end_date=request.end_date,
+                time_query=request.time_query,
+                view_mode=str(request.query or "meetings:primary"),
             )
             # An explicit/self meeting request becomes the current calendar
             # context and must replace any older manager/employee availability
@@ -4277,8 +6673,99 @@ class Orchestrator:
                     "mode": "self_meetings",
                 }
                 state["task_flow"] = {}
+
+                # Preserve the natural meaning of a short "اي" after the answer.
+                # If the current primary meeting response hid Tawasul items, "اي"
+                # means "show the Tawasul events". Morning-window continuation keeps
+                # its existing priority when no Tawasul offer is present.
+                rows_for_offer = [
+                    row for row in _rows_from_data(data)
+                    if isinstance(row, dict)
+                ]
+                tawasul_rows = []
+                for row in rows_for_offer:
+                    organizer_value = str(
+                        row.get("organizerName")
+                        or row.get("organizer_name")
+                        or row.get("OrganizerName")
+                        or row.get("organizer")
+                        or ""
+                    ).strip().casefold()
+                    if organizer_value == "tawasul" or organizer_value.startswith("tawasul "):
+                        tawasul_rows.append(row)
+                is_tawasul_view = str(request.query or "").strip() == "meetings:tawasul"
+
+                if tawasul_rows and not is_tawasul_view:
+                    follow_req = request.model_copy(deep=True)
+                    follow_req.query = "meetings:tawasul"
+                    follow_req.clarification_reason = ""
+                    state["pending"] = {
+                        "kind": "tawasul_events_offer",
+                        "query": "",
+                        "candidates": [],
+                        "request": follow_req.model_dump(),
+                        "message": "after_primary_meetings",
+                    }
+                    print(
+                        f"[Pending Saved] kind='tawasul_events_offer' "
+                        f"count={len(tawasul_rows)} period={request.period!r} "
+                        f"start={request.start_date!r} end={request.end_date!r}",
+                        file=sys.stderr,
+                    )
+                elif str(request.time_query or "").strip() == "07:00-12:00":
+                    follow_req = request.model_copy(deep=True)
+                    follow_req.time_query = "12:00-17:00"
+                    follow_req.clarification_reason = ""
+                    state["pending"] = {
+                        "kind": "meeting_followup_window",
+                        "query": "",
+                        "candidates": [],
+                        "request": follow_req.model_dump(),
+                        "message": "after_meeting_result",
+                    }
+                else:
+                    _clear_pending(state)
         elif request.intent == "tarasol_count":
-            answer = render_tarasol_count(data, language, subject_name=subject_name, self_subject=self_subject)
+            answer = render_tarasol_count(
+                data,
+                language,
+                subject_name=subject_name,
+                self_subject=self_subject,
+            )
+
+            # If the signed-in user has transactions, persist the exact action
+            # offered by the renderer so a short "اي" can execute it.
+            if self_subject:
+                count_value = data.get("count") if isinstance(data, dict) else None
+                try:
+                    tarasol_count_value = int(float(str(count_value)))
+                except Exception:
+                    tarasol_count_value = 0
+
+                if tarasol_count_value > 0:
+                    follow_req = request.model_copy(deep=True)
+                    follow_req.intent = "tarasol_details"
+                    follow_req.operation = "details"
+                    follow_req.targets = [TargetRef(kind="self", name="")]
+                    follow_req.fields = ["all"]
+                    follow_req.query = "tarasol:self_details"
+                    follow_req.clarification_reason = ""
+                    follow_req.confidence = 1.0
+                    state["pending"] = {
+                        "kind": "tarasol_details_offer",
+                        "query": "",
+                        "candidates": [],
+                        "request": follow_req.model_dump(),
+                        "message": "after_tarasol_count",
+                    }
+                    print(
+                        f"[Pending Saved] kind='tarasol_details_offer' "
+                        f"count={tarasol_count_value}",
+                        file=sys.stderr,
+                    )
+                else:
+                    _clear_pending(state)
+
         elif request.intent == "tarasol_details":
             localized_tarasol = await localize_tarasol_data(data, language)
             answer = render_tarasol(localized_tarasol, language, subject_name=subject_name, self_subject=self_subject)
@@ -4383,7 +6870,7 @@ class Orchestrator:
         rows = [row for row in (rows or []) if isinstance(row, dict)]
         if not rows:
             return (
-                "ما لقيت بيانات إدارات عامة مؤكدة في دليل الموظفين."
+                "ما ظهرت لي بيانات كافية عن الإدارات العامة حاليًا."
                 if language == "ar"
                 else "I couldn't find verified general-department data in the employee directory."
             )
@@ -4436,10 +6923,90 @@ class Orchestrator:
         return "\n".join(lines)
 
     @staticmethod
-    def _render_general_department_members(data: dict[str, Any], language: str) -> str:
+    def _english_person_name(value: Any) -> str:
+        raw = re.sub(r"\s+", " ", str(value or "").strip())
+        if not raw:
+            return ""
+        acronyms = {"RCRC", "IT", "HR", "PMO", "ICT", "AI", "OCI", "API", "CAB"}
+        parts = []
+        for token in raw.split():
+            if token.upper() in acronyms:
+                parts.append(token.upper())
+            elif token.isupper() or token.islower():
+                parts.append(token.capitalize())
+            else:
+                parts.append(token)
+        return " ".join(parts)
+
+    @staticmethod
+    def _english_job_title(value: Any) -> str:
+        raw = re.sub(r"\s+", " ", str(value or "").strip())
+        if not raw or re.search(r"[\u0600-\u06ff]", raw):
+            return ""
+        small = {"and", "of", "for", "the", "in", "to", "with"}
+        acronyms = {"IT", "HR", "PMO", "ICT", "AI", "OCI", "API", "RCRC", "CAB"}
+        words = []
+        for idx, token in enumerate(raw.split()):
+            upper = token.upper()
+            lower = token.lower()
+            if upper in acronyms:
+                words.append(upper)
+            elif lower in small and idx > 0:
+                words.append(lower)
+            else:
+                words.append(lower.capitalize())
+        return " ".join(words)
+
+    @staticmethod
+    def _english_department_name(data: dict[str, Any], rows: list[dict[str, Any]]) -> str:
+        for key in ("general_department_en", "department_en"):
+            value = str(data.get(key) or "").strip()
+            if value and not re.search(r"[\u0600-\u06ff]", value):
+                return value
+
+        for row in rows:
+            for key in ("general_department_en", "department_en"):
+                value = str(row.get(key) or "").strip()
+                if value and not re.search(r"[\u0600-\u06ff]", value):
+                    return value
+
+        ar_name = str(data.get("general_department") or "").strip()
+        known = {
+            "الإدارة العامة للتقنية والرقمنة": "General Department of Digital & Technology",
+            "الادارة العامة للتقنية والرقمنة": "General Department of Digital & Technology",
+        }
+        return known.get(ar_name, "the selected department")
+
+    @staticmethod
+    def _compact_directory_name(value: Any) -> str:
+        raw = re.sub(r"\s+", " ", str(value or "").strip())
+        if not raw:
+            return ""
+        parts = raw.split(" ")
+        if len(parts) <= 2:
+            return raw
+        if parts[0] == "عبد" and len(parts) >= 4:
+            return f"{parts[0]} {parts[1]} {parts[-1]}"
+        return f"{parts[0]} {parts[-1]}"
+
+    @classmethod
+    def _compact_directory_names(cls, names: list[str]) -> list[str]:
+        compact = [cls._compact_directory_name(name) for name in names]
+        counts: dict[str, int] = {}
+        for value in compact:
+            key = value.casefold()
+            if key:
+                counts[key] = counts.get(key, 0) + 1
+        return [
+            full if short and counts.get(short.casefold(), 0) > 1 else (short or full)
+            for full, short in zip(names, compact)
+        ]
+
+    @classmethod
+    def _render_general_department_members(cls, data: dict[str, Any], language: str) -> str:
         if not data.get("matched"):
             return (
-                "ما لقيت إدارة مطابقة بشكل مؤكد."
+                "ما لقيت إدارة مطابقة بشكل واضح 🔎 جرّب تكتب اسمها بطريقة ثانية."
                 if language == "ar"
                 else "I couldn't find a verified matching department."
             )
@@ -4447,25 +7014,43 @@ class Orchestrator:
         name = str(data.get("general_department") or "").strip()
         rows = [row for row in (data.get("employees") or []) if isinstance(row, dict)]
         count = len(rows)
+
         if language == "en":
-            for row in rows:
-                candidate = str(row.get("general_department_en") or row.get("department_en") or "").strip()
-                if candidate:
-                    name = candidate
-                    break
-            if re.search(r"[\u0600-\u06ff]", name): name = "the selected department"
-        header = f"موظفو {name} ({count}):" if language == "ar" else f"Employees in {name} ({count}):"
-        lines = [header]
-        for idx, row in enumerate(rows, start=1):
+            name = cls._english_department_name(data, rows)
+
+        raw_names: list[str] = []
+        for row in rows:
             if language == "ar":
-                emp_name = str(row.get("name_ar") or row.get("name") or directory_employee_name(row) or row.get("username") or "").strip()
-                title = str(row.get("job_title_ar") or row.get("job_title") or "").strip()
+                raw_names.append(str(
+                    row.get("name_ar") or row.get("name")
+                    or directory_employee_name(row) or row.get("username") or ""
+                ).strip())
             else:
-                emp_name = str(row.get("name_en") or row.get("name") or row.get("username") or "").strip()
-                title = str(row.get("job_title_en") or row.get("job_title") or "").strip()
-                if re.search(r"[\u0600-\u06ff]", emp_name): emp_name = str(row.get("username") or "Employee").strip()
-                if re.search(r"[\u0600-\u06ff]", title): title = ""
+                raw_names.append(cls._english_person_name(
+                    row.get("name_en") or row.get("name") or row.get("username") or ""
+                ))
+
+        display_names = cls._compact_directory_names(raw_names)
+
+        if language == "ar":
+            if count == 0:
+                return f"راجعت دليل الموظفين، وما ظهر لي موظفين تحت **{name}** حاليًا."
+            lines = [f"أكيد 😊 موظفو {name} ({count}):"]
+        else:
+            lines = [f"Sure — I found {count} employees in {name}:"]
+
+        for idx, (row, emp_name) in enumerate(zip(rows, display_names), start=1):
+            title = str(
+                row.get("job_title_ar") or row.get("job_title") or ""
+                if language == "ar"
+                else row.get("job_title_en") or row.get("job_title") or ""
+            ).strip()
+            if language == "en":
+                title = cls._english_job_title(title)
             lines.append(f"{idx}. {emp_name}" + (f" — {title}" if title else ""))
+
+        if language == "ar":
+            lines.extend(["", "إذا تبي بيانات موظف معيّن، اختار رقمه وأنا أكمل لك."])
         return "\n".join(lines)
 
     async def _execute_directory_query(
@@ -4508,7 +7093,7 @@ class Orchestrator:
                 data = await self.directory.employee_gender_counts(access_token=context.access_token)
                 if not bool(data.get("has_verified_gender")):
                     return (
-                        "بيانات الجنس غير متوفرة بشكل موثوق في دليل الموظفين حاليًا، لذلك ما أقدر أحسب عدد الإناث أو الذكور بدون تخمين."
+                        "ما أقدر أعطيك عدد دقيق حاليًا لأن البيانات المتاحة ما تكفي للحساب."
                         if language == "ar"
                         else "Verified gender data is not available in the employee directory right now, so I can't count female or male employees without guessing."
                     )
@@ -4592,10 +7177,38 @@ class Orchestrator:
 
                 name = str(data.get("general_department") or request.department_query).strip()
                 count = len(members)
+
+                if str(request.query or "") == "department:summary":
+                    follow_req = request.model_copy(deep=True)
+                    follow_req.intent = "general_department_members"
+                    follow_req.operation = "list"
+                    follow_req.fields = ["name", "job_title"]
+                    follow_req.query = "department:members"
+                    follow_req.clarification_reason = ""
+                    follow_req.confidence = 1.0
+                    state["pending"] = {
+                        "kind": "department_members_offer",
+                        "request": follow_req.model_dump(),
+                        "query": "",
+                        "candidates": [],
+                        "message": "after_department_summary",
+                    }
+                    print(
+                        f"[Pending Saved] kind='department_members_offer' "
+                        f"department={name!r} count={count}",
+                        file=sys.stderr,
+                    )
+                    return (
+                        f"في {name} فيه {count} موظف 😊\n"
+                        "إذا تبي، أعرض لك القائمة."
+                        if language == "ar"
+                        else f"There are {count} employees in {name} ⭐\nSay 'show me' if you'd like the list 👋"
+                    )
+
                 return (
-                    f"عدد الموظفين في {name} هو {count} موظف."
+                    f"في {name} فيه {count} موظف 😊"
                     if language == "ar"
-                    else f"{name} has {count} employees."
+                    else f"There are {count} employees in {name} ⭐"
                 )
 
             data = await self.directory.general_department_counts(access_token=context.access_token)
@@ -4624,7 +7237,7 @@ class Orchestrator:
                 query = str(ctx.get("general_department") or "").strip()
 
             if not query:
-                return "أي إدارة تقصد؟" if language == "ar" else "Which department do you mean?"
+                return "أي إدارة تقصد؟ 😊" if language == "ar" else "Which department do you mean?"
 
             data = await self.directory.general_department_members(
                 access_token=context.access_token,
@@ -4647,9 +7260,36 @@ class Orchestrator:
                     f"count={len(members)}",
                     file=sys.stderr,
                 )
+            rows_for_selection = [
+
+                row for row in (data.get("employees") or [])
+
+                if isinstance(row, dict)
+
+            ]
+
+            state["list_state"] = {
+
+                "kind": "department_employees",
+                "intent": "general_department_members",
+
+                "department": str(data.get("general_department") or request.department_query or ""),
+
+                "items": rows_for_selection,
+
+            }
+
+            print(
+
+                f"[List State Saved] kind='department_employees' count={len(rows_for_selection)}",
+
+                file=sys.stderr,
+
+            )
+
             return self._render_general_department_members(data, language)
 
-        return "ممكن توضح طلبك؟" if language == "ar" else "Could you clarify your request?"
+        return "أكيد 😊 وضّح لي طلبك أكثر." if language == "ar" else "Could you clarify your request?"
 
     async def _execute_request(
         self,
@@ -4668,17 +7308,66 @@ class Orchestrator:
                 return self._tool_error({"error_type": "authorization"}, language)
             except EmployeeAPIError as exc:
                 print(f"[Directory Query Error] {exc}", file=sys.stderr)
-                return "آسف 😅 ما قدرت أوصل لبيانات الموظفين هالمرة. وأنا لسه في مرحلتي التجريبية، وقاعد أتعلم وأتطور باستمرار." if language == "ar" else "Sorry, I couldn\'t retrieve employee information this time. I\'m still in my experimental phase and continuing to learn and improve."
+                return (
+                    "ما قدرت أوصل لدليل الموظفين هالمرة 😊\nجرّب مرة ثانية بعد شوي."
+                    if language == "ar"
+                    else "I couldn’t reach the employee directory this time 😊\nPlease try again shortly."
+                )
 
         if request.intent in DETAIL_BASE_INTENT:
             data, error = await self._resolve_detail_item(request, state, context, language)
             if error:
                 return error
-            return render_content_detail(request.intent, data, language)
+
+            salutation = ""
+            if request.intent == "mazaya_details" and language == "ar":
+                profile_result = await self._execute_tool(
+                    "get_employee_profile",
+                    {},
+                    context,
+                    target_username=context.username,
+                )
+                if profile_result.get("success"):
+                    profile_data = (
+                        profile_result.get("data")
+                        if isinstance(profile_result.get("data"), dict)
+                        else {}
+                    )
+                    salutation = _arabic_gender_salutation(profile_data)
+
+                if not salutation:
+                    salutation = "أكيد"
+
+            is_full_content = str(request.query or "") == "content:full"
+            rendered = render_content_detail(
+                request.intent,
+                data,
+                language,
+                salutation=salutation,
+                full_details=is_full_content,
+            )
+            if request.intent in {"news_details", "announcement_details"} and not is_full_content:
+                state["pending"] = {
+                    "kind": "content_full_details",
+                    "query": "content:full",
+                    "candidates": [],
+                    "request": request.model_dump(),
+                    "message": "offered_full_content",
+                }
+            return rendered
 
         policy = get_policy(request.intent)
         if policy is None:
-            return "ممكن توضح طلبك؟" if language == "ar" else "Could you clarify your request?"
+            return "أكيد 😊 وضّح لي طلبك أكثر." if language == "ar" else "Could you clarify your request?"
+
+        # Guard against a named employee silently becoming the authenticated user.
+        # A missing named target must be clarified/resolved, never mapped to self.
+        if request.intent == "employee_details" and any(
+            t.kind == "employee" and str(t.name or "").strip() for t in request.targets
+        ) and not resolved_targets:
+            return ("🔎 ما لقيت تطابقًا مؤكدًا لاسم الموظف. ممكن تكتب الاسم الكامل؟"
+                    if language == "ar" else
+                    "🔎 I couldn't confirm the employee. Please provide the full name.")
 
         # Target-scoped execution.
         if policy.target_mode in {"self_default", "required_employee"}:
@@ -4704,7 +7393,7 @@ class Orchestrator:
             if request.targets:
                 rows = [target.employee for target in resolved_targets if target.employee]
                 if not rows:
-                    return "ما لقيت موظفين مطابقين." if language == "ar" else "I couldn't find matching employees."
+                    return "ما لقيت موظف مطابق للاسم هذا حاليًا 🔎😊 تأكد من الاسم وجرب مرة ثانية." if language == "ar" else "I couldn't find matching employees."
                 state["list_state"] = {"intent": "employee_search", "items": rows[:20], "query": request.query}
                 for row in rows[:20]:
                     _remember_entity(state, row, set_focus=False)
@@ -4714,7 +7403,31 @@ class Orchestrator:
 
             search_query = _clean_employee_discovery_query(request.query)
             if not search_query:
-                return "اكتب اسم الموظف أو المسمى أو الإدارة للبحث عنها." if language == "ar" else "Enter an employee name, role, or department to search for."
+                return "اكتب لي اسم الموظف أو المسمى أو الإدارة، وأنا أبحث لك 😊" if language == "ar" else "Enter an employee name, role, or department to search for."
+
+            if re.fullmatch(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", search_query):
+                try:
+                    directory_payload = await self.employee_api.search_directory_rows(
+                        access_token=context.access_token, search="", batch_size="5000"
+                    )
+                    raw_matches = [r for r in (directory_payload.get("employees") or [])
+                                   if isinstance(r, dict) and str(r.get("emailAddress") or r.get("email") or "").strip().casefold() == search_query.casefold()]
+                except EmployeeAuthenticationError:
+                    return self._tool_error({"error_type":"auth"}, language)
+                except EmployeeAuthorizationError:
+                    return self._tool_error({"error_type":"authorization"}, language)
+                except EmployeeAPIError as exc:
+                    print(f"[Employee Email Search Error] {exc}", file=sys.stderr)
+                    return ("⚠️ تعذر البحث في دليل الموظفين حاليًا." if language == "ar"
+                            else "⚠️ Employee directory search is temporarily unavailable.")
+                if not raw_matches:
+                    return ("🔎 ما لقيت موظفًا مرتبطًا بهذا البريد في دليل الهيئة." if language == "ar"
+                            else "🔎 No employee matched that email address.")
+                matched = _normalize_directory_discovery_row(raw_matches[0], language)
+                _remember_entity(state, matched, set_focus=True)
+                detail_request = request.model_copy(update={"intent": "employee_details", "operation": "details",
+                                                     "fields": ["name", "job_title", "department", "email"]})
+                return render_profile(matched, detail_request, language, self_subject=False)
 
             try:
                 # "IT" is an organisational browse query, not a person's name.
@@ -4750,7 +7463,7 @@ class Orchestrator:
                 return self._tool_error({"error_type": "authorization"}, language)
             except EmployeeAPIError as exc:
                 print(f"[Employee Discovery Error] {exc}", file=sys.stderr)
-                return "آسف 😅 ما قدرت أبحث عن الموظف هالمرة. وأنا لسه في مرحلتي التجريبية، وقاعد أتعلم وأتطور باستمرار." if language == "ar" else "Sorry, I couldn't search for the employee this time. I'm still in my experimental phase and continuing to learn and improve."
+                return "آسف 😅 ما قدرت أكمل البحث عن الموظف هالمرة، وما راح أخمّن نتيجة." if language == "ar" else "Sorry, I couldn't search for the employee this time. I'm still in my experimental phase and continuing to learn and improve."
             verified_rows: list[dict[str, Any]] = []
             seen: set[str] = set()
             for raw_row in raw_rows or []:
@@ -4797,7 +7510,7 @@ class Orchestrator:
                 return self._tool_error({"error_type": "authorization"}, language)
             except EmployeeAPIError as exc:
                 print(f"[Role Directory Query Error] {exc}", file=sys.stderr)
-                return "آسف 😅 ما قدرت أبحث عن صاحب المنصب هالمرة. وأنا لسه في مرحلتي التجريبية، وقاعد أتعلم وأتطور باستمرار." if language == "ar" else "Sorry, I couldn't search for the role holder this time. I'm still in my experimental phase and continuing to learn and improve."
+                return "آسف 😅 ما قدرت أتحقق من صاحب المنصب هالمرة، وما راح أخمّن اسم." if language == "ar" else "Sorry, I couldn't search for the role holder this time. I'm still in my experimental phase and continuing to learn and improve."
         else:
             result = await self._execute_tool(policy.tool_name, self._tool_args(request, language), context)
             if not result.get("success"):
@@ -4901,7 +7614,7 @@ class Orchestrator:
                 }
                 if language == "ar":
                     return (
-                        "لقيت نتيجة/نتائج قريبة للمنصب، لكن المطابقة غير مؤكدة لذلك ما راح أخمّن.\n"
+                        "لقيت نتائج قريبة، لكن ما أبي أعطيك اسم غير مؤكد.\n"
                         + candidate_text
                         + "\nاكتب رقم الموظف أو اسمه، أو حدّد المنصب بشكل أدق."
                     )
@@ -4917,7 +7630,7 @@ class Orchestrator:
 
             if not rows:
                 return (
-                    f"ما لقيت شخصًا مؤكّدًا لهذا المنصب: {request.role_query}."
+                    f"ما ظهر لي شخص مطابق بشكل مؤكد لهذا المنصب: {request.role_query}."
                     if language == "ar"
                     else f"I couldn't find a verified employee for this role: {request.role_query}."
                 )
@@ -5008,10 +7721,30 @@ class Orchestrator:
             print(f"[Context Migration v160] reset stale transient context for {memory_key!r}", file=sys.stderr)
 
         fallback_language = str(state.get("language") or "ar")
+
+        original_message = message
+        pending_for_alias = state.get("pending") if isinstance(state.get("pending"), dict) else {}
+        pending_kind_for_alias = str(pending_for_alias.get("kind") or "")
+        if (
+            message.casefold() == "hd"
+            and pending_kind_for_alias in {
+                "department_members_offer",
+                "tarasol_details_offer",
+                "tawasul_events_offer",
+                "employee_more_details",
+            }
+        ):
+            message = "اي"
+            print(
+                f"[Keyboard Layout Confirmation] {original_message!r} -> {message!r} "
+                f"pending={pending_kind_for_alias!r}",
+                file=sys.stderr,
+            )
+
         language = detect_language(message, fallback=fallback_language)
         state["language"] = language
         if record_user:
-            self.memory.append_message(memory_key, "user", message)
+            self.memory.append_message(memory_key, "user", original_message)
 
         # Ephemeral language context for the semantic model. This is deliberately
         # not an authority for enterprise facts; verified state/API data remain the
@@ -5020,7 +7753,7 @@ class Orchestrator:
         print(f"[Conversation Memory] key={memory_key!r}", file=sys.stderr)
 
         def finish(answer: str, *, sources: list[str] | None = None, save_state: bool = True) -> tuple[str, list[dict], list[str]]:
-            clean = _friendly_surface(str(answer or "").strip(), language)
+            clean = polish_response(str(answer or "").strip(), language=language)
             if save_state:
                 ephemeral_dialogue = state.pop("_recent_dialogue", None)
                 self.memory.save_state(memory_key, state)
@@ -5029,6 +7762,29 @@ class Orchestrator:
             if record_assistant:
                 self.memory.append_message(memory_key, "assistant", clean)
             return clean, [], list(sources or [])
+
+        # Explicit calendar dates lacking a year: ask only for the missing year.
+        # Pending context is persisted in the existing sanitized conversation state.
+        date_pending = state.get("pending") if isinstance(state.get("pending"), dict) else {}
+        if date_pending.get("kind") == "date_year_clarification":
+            revised, consumed = date_year_turn(message, date_pending.get("message", ""))
+            if consumed:
+                message = revised
+                state["pending"] = {"kind": "", "query": "", "candidates": [], "request": {}, "message": ""}
+            elif not dated_message_needs_year(message):
+                # A fresh question cancels obsolete clarification context.
+                state["pending"] = {"kind": "", "query": "", "candidates": [], "request": {}, "message": ""}
+        if dated_message_needs_year(message):
+            state["pending"] = {"kind": "date_year_clarification", "query": "", "candidates": [], "request": {}, "message": message}
+            return finish(
+                "📅 لأي سنة تقصد الفترة المذكورة؟" if language == "ar"
+                else "📅 Which year should I use for those dates?",
+                save_state=True,
+            )
+
+        # Leave overlap is enabled: allow verified requests to reach
+        # the leave_overlap intent and get_intersected_vacations tool.
+        # Do not short-circuit with the old testing-phase disabled message.
 
         calc = _safe_calculation(message)
         if calc is not None:
@@ -5047,12 +7803,9 @@ class Orchestrator:
         if frustration is not None:
             return finish(frustration, save_state=True)
 
-        # Friendly in-app navigation: generic policy requests point to the app
-        # location instead of unnecessarily querying the policy API.
-        policy_nav = _generic_policy_navigation(message, language)
-        if policy_nav is not None:
-            state["task_flow"] = {}
-            return finish(policy_nav, save_state=True)
+        # Generic policy requests must continue through semantic routing and
+        # the verified Policy API so Sanad can list the available policies.
+        # The renderer adds the in-app navigation hint after the real list.
 
         # Continue an availability preference question first.
         availability_turn = _availability_preference_turn(message, state, language)
@@ -5111,6 +7864,12 @@ class Orchestrator:
         focus_state = state.get("focus") if isinstance(state.get("focus"), dict) else {}
         mixed_focus = focus_state.get("current") if isinstance(focus_state.get("current"), dict) else {}
         mixed_uid = _uid(mixed_focus)
+        has_focus = bool(
+            mixed_uid
+            or str(mixed_focus.get("name") or "").strip()
+            or str(mixed_focus.get("name_ar") or "").strip()
+            or str(mixed_focus.get("name_en") or "").strip()
+        )
         manager_ref = bool(re.search(r"(?:مديرها|مديره|مديرهم|his\s+manager|her\s+manager)", mix_norm, re.I))
 
         if employee_context is not None and mixed_uid and manager_ref:
@@ -5173,42 +7932,532 @@ class Orchestrator:
                 )
                 return finish(f"{first_answer}\n{second_answer}")
 
+        # v173 EXACT RESTORE: the original self-meetings wizard is a backend
+        # state machine, not an LLM conversation.  Only the flow that *asked*
+        # the user to choose a day proceeds to the second question about the
+        # part of day.  Direct requests such as "اجتماعاتي اليوم" continue to
+        # execute immediately, as before.
+        pending_exact = state.get("pending") if isinstance(state.get("pending"), dict) else {}
+        pending_exact_kind = str(pending_exact.get("kind") or "")
+        pending_exact_req = pending_exact.get("request") if isinstance(pending_exact.get("request"), dict) else {}
+        inline_meeting_request = None
+
+        # Step 2 of: "ابي جدول اجتماعاتي" -> choose day -> choose time window.
+        if (
+            pending_exact_kind == "missing_date_range"
+            and str(pending_exact_req.get("intent") or "") in {"meetings", "meeting_list"}
+            and _has_explicit_period_cue(message)
+        ):
+            period, start_date, end_date = _availability_period(message)
+            if period not in {"", "none"}:
+                try:
+                    restored = ParsedRequest.model_validate(pending_exact_req)
+                except Exception:
+                    restored = ParsedRequest(
+                        intent="meetings", operation="list",
+                        targets=[TargetRef(kind="self", name="")],
+                        fields=["subject", "start_time", "end_time"],
+                    )
+                restored.intent = "meetings"
+                restored.operation = "list"
+                restored.targets = [TargetRef(kind="self", name="")]
+                restored.fields = ["subject", "start_time", "end_time"]
+                restored.period = period
+                restored.start_date = start_date
+                restored.end_date = end_date
+                # If the same turn already contains a time window (e.g.
+                # "ابي يوم الثلاثاء الصباح"), execute it immediately.
+                # Only ask the second wizard question when no window was supplied.
+                inline_time_query = _extract_time_query(message)
+                restored.time_query = inline_time_query or ""
+                restored.clarification_reason = ""
+                restored.confidence = 1.0
+
+                state["meeting_context"] = {
+                    "subject_kind": "self",
+                    "employee": {},
+                    "period": period,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "time_query": restored.time_query,
+                    "mode": "self_meetings" if inline_time_query else "self_meetings_wizard",
+                }
+                _record_request(state, restored)
+
+                # The user has now answered the only required follow-up:
+                # which day/period to check. Execute all meetings in that
+                # selected period unless a time window was explicitly supplied.
+                _clear_pending(state)
+                inline_meeting_request = restored
+                print(
+                    f"[Exact Meeting Period Selected] {restored.model_dump()}",
+                    file=sys.stderr,
+                )
+
+        # Step 3: a short answer such as "الصباح" inherits the selected day.
+        if inline_meeting_request is not None:
+            pending_request = inline_meeting_request
+        elif pending_exact_kind == "meeting_time_window":
+            time_query = _extract_time_query(message)
+            if time_query:
+                try:
+                    restored = ParsedRequest.model_validate(pending_exact_req)
+                except Exception:
+                    restored = ParsedRequest(
+                        intent="meetings", operation="list",
+                        targets=[TargetRef(kind="self", name="")],
+                        fields=["subject", "start_time", "end_time"],
+                    )
+                restored.intent = "meetings"
+                restored.operation = "list"
+                restored.targets = [TargetRef(kind="self", name="")]
+                restored.fields = ["subject", "start_time", "end_time"]
+                restored.time_query = time_query
+                restored.clarification_reason = ""
+                restored.confidence = 1.0
+                # Do not clear meeting_context here; the renderer/execution path
+                # uses the same verified selected day and filters by this window.
+                state["pending"] = {"kind": "", "query": "", "candidates": [], "request": {}, "message": ""}
+                request = restored
+                print(f"[Exact Meeting Window] {request.model_dump()}", file=sys.stderr)
+                pending_request = request
+            else:
+                pending_request = None
+        else:
+            pending_request = None
+
+        # v196: writing follow-ups stay attached to the last email draft.
+        # This must run before semantic/employee routing so short turns such as
+        # "ترجمه" or "خله رسمي أكثر" cannot become a directory lookup.
+        if _is_writing_followup_request(message, state):
+            writing_ctx = _writing_context(state)
+            previous_draft = str(writing_ctx.get("draft") or "").strip()
+            target_language = _writing_followup_target_language(message, state)
+            answer = await self._email_followup_answer(
+                message, previous_draft, target_language
+            )
+            state["writing_context"] = {
+                "kind": "email",
+                "draft": answer,
+                "language": target_language,
+                "recipient_name": str(writing_ctx.get("recipient_name") or ""),
+                "source_message": str(writing_ctx.get("source_message") or ""),
+            }
+            print(
+                f"[Email Followup Route] target_language={target_language!r} instruction={message[:80]!r}",
+                file=sys.stderr,
+            )
+            return finish(answer, save_state=True)
+
+        # v195: HARD email-drafting route. Writing an email is ordinary LLM work
+        # and must never be interpreted as an employee-directory lookup just
+        # because the request mentions "مديري" or contains the word "ايميل".
+        # Run this before pending/semantic/employee routing.
+        if _is_email_drafting_request(message):
+            facts = await self._writing_facts(message, employee_context, language, state)
+            answer = await self._email_draft_answer(message, language, facts)
+            if not _email_request_is_vague(message):
+                state["writing_context"] = {
+                    "kind": "email",
+                    "draft": answer,
+                    "language": language,
+                    "recipient_name": str(facts.get("recipient_name") or ""),
+                    "source_message": message,
+                }
+            print("[Email Draft Hard Route] direct_writing", file=sys.stderr)
+            return finish(answer, save_state=True)
+
         # Conversation-first routing:
         # 1) pending explicit list selection
         # 2) semantic model with recent dialogue
         # 3) deterministic critical preflight only as fallback
-        pending_request = restore_pending_selection(message, state)
+        if pending_request is None:
+            # Department employee numbered-list selection has highest priority.
+            # The generic reference_resolver also understands numbers, so if it
+            # runs first it can steal "22" and reinterpret it in another domain.
+            list_state_now = state.get("list_state") if isinstance(state.get("list_state"), dict) else {}
+            if (
+                (str(list_state_now.get("kind") or "") == "department_employees" or str(list_state_now.get("intent") or "") == "general_department_members")
+                and _list_selection_index(message) is not None
+            ):
+                pending_request = _critical_orchestrator_preflight(
+                    message,
+                    state,
+                    language,
+                )
+                if pending_request is not None:
+                    print(
+                        f"[Department List Selection Priority] text={message!r} "
+                        f"query={pending_request.query!r}",
+                        file=sys.stderr,
+                    )
+
+        if pending_request is None:
+            # Content selection/full-detail follow-ups are resolved from verified
+            # state BEFORE generic employee selection or the LLM.
+            pending_request = _restore_full_content_followup(message, state)
+        if pending_request is None:
+            # A second number after opening benefit #1 still refers to the
+            # last verified benefits list; never reinterpret it as hours.
+            _ls = state.get("list_state") if isinstance(state.get("list_state"), dict) else {}
+            _base_to_detail = {
+                "mazaya": "mazaya_details", "news": "news_details",
+                "announcements": "announcement_details", "policy_search": "policy_details",
+            }
+            _selected_number = _content_selection_number(message)
+            _items = _ls.get("items") if isinstance(_ls.get("items"), list) else []
+            if (_selected_number > 0 and _selected_number <= len(_items)
+                    and str(_ls.get("intent") or "") in _base_to_detail):
+                pending_request = ParsedRequest(
+                    intent=_base_to_detail[str(_ls["intent"])],
+                    operation="details", targets=[], fields=["all"],
+                    query="", ordinal=_selected_number, confidence=1.0,
+                )
+        if pending_request is None:
+            pending_request = _restore_content_detail_selection(message, state)
+        if pending_request is None:
+            pending_request = restore_pending_selection(message, state)
         if pending_request is not None:
             request = pending_request
             print(f"[Pending Selection] intent={request.intent}", file=sys.stderr)
         else:
             semantic_text = _semantic_message(message)
-            request = await self.parser.parse(semantic_text, state, language=language)
-            print(f"[Semantic Request] text={semantic_text!r} {request.model_dump()}", file=sys.stderr)
 
-            # Qwen handles open-ended meaning, while closed enterprise grammar
-            # protects exact relations, requested fields, and pending date flows.
-            critical_request = _critical_orchestrator_preflight(semantic_text, state, language)
-            if critical_request is not None:
-                cq = str(critical_request.query or "")
-                strong_closed_grammar = bool(
-                    cq.startswith(("manager:", "employee:focus_", "profile:self_", "profile:summary", "meetings:self", "attendance:"))
-                    or critical_request.clarification_reason == "missing_date_range"
-                    or (
-                        critical_request.intent == request.intent
-                        and set(critical_request.fields or []).issuperset(set(request.fields or []))
-                        and len(critical_request.fields or []) > len(request.fields or [])
+            # v171: CLOSED FOLLOW-UPS BYPASS THE LLM.
+            #
+            # These turns are structurally determined by verified conversation
+            # state and must never be reinterpreted as a new employee/search:
+            #   "ابي ايميله ورقم جواله" after a verified person -> focus details
+            #   "الصباح" after selecting Tuesday meetings -> same day + morning
+            #
+            # Running these through Qwen first caused valid focus references to
+            # occasionally become invented intents or fake employee names.
+            closed_request = _critical_orchestrator_preflight(semantic_text, state, language)
+            pending_now = state.get("pending") if isinstance(state.get("pending"), dict) else {}
+            closed_query = str(closed_request.query or "") if closed_request is not None else ""
+            # A verified leave what-if is closed grammar, not an open-ended LLM guess.
+            is_leave_calculation = bool(
+                closed_request is not None
+                and closed_request.intent == "leave_balance"
+                and closed_request.operation == "calculate"
+                and str(closed_request.query or "") == "leave:self_hypothetical"
+            )
+            is_focus_contact_followup = bool(
+                closed_request is not None
+                and closed_request.intent == "employee_details"
+                and any(t.kind == "focus" for t in (closed_request.targets or []))
+                and closed_query.startswith("employee:focus_")
+            )
+            is_meeting_window_followup = bool(
+                closed_request is not None
+                and closed_request.intent in {"meetings", "meeting_list"}
+                and str(pending_now.get("kind") or "") == "meeting_time_window"
+                and bool(str(closed_request.time_query or "").strip())
+            )
+
+            # Target-priority fix: an explicitly named employee ALWAYS wins over
+            # LLM guesses and cached self-profile context.
+            from core.direct_employee_intent import direct_employee_lookup as _direct_employee_lookup
+            _explicit_employee = _direct_employee_lookup(semantic_text)
+            _explicit_employee_request = None
+            if _explicit_employee is not None:
+                _mode, _person, _fields = _explicit_employee
+                if _mode == "email_lookup":
+                    _explicit_employee_request = ParsedRequest(
+                        intent="employee_search", operation="search", targets=[],
+                        fields=_fields, query=_person, confidence=1.0,
+                    )
+                elif re.match(r"^(?:ابحث|أبحث|دور|دوّر|دورلي|دور\s+لي|search|find)\b", semantic_text.strip(), re.I):
+                    _explicit_employee_request = ParsedRequest(
+                        intent="employee_search", operation="search", targets=[],
+                        fields=["name", "job_title", "department"], query=_person, confidence=1.0,
+                    )
+                else:
+                    _explicit_employee_request = ParsedRequest(
+                        intent="employee_details", operation="details",
+                        targets=[TargetRef(kind="employee", name=_person)],
+                        fields=_fields, query="employee:direct_lookup", confidence=1.0,
+                    )
+
+            # Closed-context priority for anaphoric contact requests.
+            # Do not let named-person parsing treat Arabic possessive suffix
+            # ("ه" from "إيميله") as an employee's actual name.
+            _focus_pronoun_request = None
+            if has_focus:
+                _ptext = " ".join(str(semantic_text or "").casefold().split())
+                _pfields = []
+                for _field, _pattern in (
+                    ("email", r"(?:[اإ]يميل(?:ه|ها)|بريد(?:ه|ها)|(?:his|her|their)\s+email)"),
+                    ("mobile", r"(?:جوال(?:ه|ها)|رقم\s+جوال(?:ه|ها)|موبايل(?:ه|ها)|(?:his|her|their)\s+(?:phone|mobile))"),
+                    ("extension", r"(?:تحويلت(?:ه|ها)|تحويل(?:ه|ها)|(?:his|her|their)\s+extension)"),
+                ):
+                    if re.search(_pattern, _ptext, re.I):
+                        _pfields.append(_field)
+                _refers_to_self = bool(re.search(
+                    r"(?:ايميلي|إيميلي|جوالي|بريدي|تحويلتي|my\s+(?:email|phone|mobile|extension))",
+                    _ptext, re.I,
+                ))
+                if _pfields and not _refers_to_self:
+                    _focus_pronoun_request = ParsedRequest(
+                        intent="employee_details", operation="details",
+                        targets=[TargetRef(kind="focus", name="")],
+                        fields=_pfields, query="employee:focus_fields",
+                        confidence=1.0,
+                    )
+
+            is_self_profile_followup = bool(
+                closed_request is not None
+                and closed_request.intent == "profile"
+                and any(t.kind == "self" for t in (closed_request.targets or []))
+                and str(closed_request.query or "").startswith("profile:self_")
+            )
+
+            # v181: direct enterprise routing for obvious News list requests.
+            # Do this BEFORE Qwen so phrases like "ابي ابرز اخبار الهيئة" cannot
+            # turn into a generic conversational clarification.
+            news_norm = re.sub(r"[؟?!.،,]+", " ", str(semantic_text or "").casefold())
+            news_norm = " ".join(news_norm.split())
+            direct_news = bool(
+                re.search(r"(?:اخبار|أخبار|news)", news_norm, re.I)
+                and (
+                    re.search(r"(?:ابرز|أبرز|اهم|أهم|اخر|آخر|احدث|أحدث|جديد|latest|recent|top|highlights?)", news_norm, re.I)
+                    or re.fullmatch(r"(?:ابي\s+)?(?:وش\s+)?(?:ال)?(?:اخبار|أخبار)(?:\s+(?:ال)?(?:هيئه|هيئة|rcrc))?", news_norm, re.I)
+                )
+            )
+
+            # Verified employee relations must win over stale semantic queries.
+            # "طيب مين مديره؟" refers to the active verified employee, not
+            # a previous question about an unrelated department manager.
+            _manager_relation_text = re.sub(r"[؟?!.،,]+", " ", str(semantic_text or "").casefold())
+            _manager_relation_text = " ".join(_manager_relation_text.split())
+            _manager_followup = bool(
+                has_focus
+                and re.search(
+                    r"(?:مديره|مديرها|مديرهم|مدير(?:ة)?\s+مديره|مدير(?:ة)?\s+مديرها|"
+                    r"(?:his|her|their)\s+manager|manager\s+of\s+(?:him|her))",
+                    _manager_relation_text, re.I,
+                )
+                and not re.search(r"(?:مديري|مديرتي|my\s+manager)", _manager_relation_text, re.I)
+            )
+            _manager_fields = []
+            if _manager_followup:
+                if re.search(r"(?:ايميل|إيميل|بريد|email)", _manager_relation_text, re.I):
+                    _manager_fields.append("email")
+                if re.search(r"(?:جوال|موبايل|رقم|mobile|phone)", _manager_relation_text, re.I):
+                    _manager_fields.append("mobile")
+                if re.search(r"(?:تحويل|extension)", _manager_relation_text, re.I):
+                    _manager_fields.append("extension")
+                # Follow-up can request only the manager name (default), or
+                # several contact fields in one question.
+                request = ParsedRequest(
+                    intent="manager", operation="details",
+                    targets=[TargetRef(kind="focus", name="")],
+                    fields=_manager_fields or ["name"],
+                    relation_depth=2 if re.search(r"مدير\s+مدير(?:ه|ها)|manager.s\s+manager", _manager_relation_text, re.I) else 1,
+                    query="manager:verified_focus_followup", confidence=1.0,
+                )
+                print(f"[Manager Followup Priority] {request.model_dump()}", file=sys.stderr)
+
+            if _manager_followup:
+                pass  # request is already routed to the verified focus manager.
+            elif direct_news:
+                request = ParsedRequest(
+                    intent="news",
+                    operation="list",
+                    targets=[],
+                    fields=["all"],
+                    query="",
+                    role_query="",
+                    department_query="",
+                    period="none",
+                    start_date="",
+                    end_date="",
+                    ordinal=0,
+                    relation_depth=1,
+                    amount=None,
+                    time_query="",
+                    confidence=1.0,
+                    clarification_reason="",
+                )
+                print(f"[Direct News Route] text={semantic_text!r} {request.model_dump()}", file=sys.stderr)
+            elif _focus_pronoun_request is not None:
+                request = _focus_pronoun_request
+                print(f"[Focus Pronoun Priority] {request.model_dump()}", file=sys.stderr)
+            elif _explicit_employee_request is not None:
+                request = _explicit_employee_request
+                print(f"[Named Employee Priority] {request.model_dump()}", file=sys.stderr)
+            elif (
+                is_leave_calculation
+                or is_focus_contact_followup
+                or is_meeting_window_followup
+                or is_self_profile_followup
+                or (
+                    closed_request is not None
+                    and str(closed_request.query or "").startswith((
+                        "department:",
+                        "employee:list_selection",
+                        "general:employee_list_selected",
+                        "tarasol:",
+                    ))
+                )
+            ):
+                request = closed_request
+                print(
+                    f"[Closed Enterprise Override] text={semantic_text!r} {request.model_dump()}",
+                    file=sys.stderr,
+                )
+            else:
+                request = await self.parser.parse(semantic_text, state, language=language)
+                print(f"[Semantic Request] text={semantic_text!r} {request.model_dump()}", file=sys.stderr)
+
+                # Qwen handles open-ended meaning, while closed enterprise grammar
+                # protects exact relations, requested fields, and pending date flows.
+                critical_request = closed_request
+                if critical_request is not None:
+                    cq = str(critical_request.query or "")
+                    strong_closed_grammar = bool(
+                        cq.startswith((
+                            "manager:",
+                            "leave:self_",
+                            "employee:focus_",
+                            "employee:explicit_",
+                            "employee:summary",
+                            "employee:list_selection",
+                            "role:explicit",
+                            "profile:self_",
+                            "profile:summary",
+                            "meetings:",
+                            "attendance:",
+                            "department:",
+                            "tarasol:",
+                        ))
+                        or critical_request.clarification_reason == "missing_date_range"
+                        or (
+                            critical_request.intent == request.intent
+                            and set(critical_request.fields or []).issuperset(set(request.fields or []))
+                            and len(critical_request.fields or []) > len(request.fields or [])
+                        )
+                    )
+                    semantic_focus_reference = bool(
+                        request.intent == "employee_details"
+                        and any(getattr(t, "kind", "") == "focus" for t in (request.targets or []))
+                        and has_focus
+                    )
+                    if (
+                        request.intent == "general"
+                        or (
+                            critical_request.intent == request.intent
+                            and (
+                                request.confidence < 0.60
+                                or bool(request.clarification_reason)
+                                or (strong_closed_grammar and not semantic_focus_reference)
+                            )
+                        )
+                    ):
+                        request = critical_request
+                        print(f"[Critical Fallback] {request.model_dump()}", file=sys.stderr)
+                    elif semantic_focus_reference and strong_closed_grammar:
+                        print(
+                            f"[Focus Reference Guard] kept semantic focus request over fallback={critical_request.model_dump()}",
+                            file=sys.stderr,
+                        )
+
+            # General questions should behave like a normal conversational assistant.
+            #
+            # Older builds required a narrow keyword shortcut here, which meant a valid
+            # semantic `general` classification (for example "وش MCP؟" or "اشرح لي API")
+            # could still fall through into enterprise validation and produce an awkward
+            # fallback. Enterprise requests are already protected by deterministic
+            # preflight + semantic evidence guards, so a genuine `general` request can
+            # safely use the no-tools conversational model.
+            #
+            # The only exception is a tiny reply while an enterprise clarification/list
+            # selection is pending ("2", "الثاني", "أنا"). Those must stay in the
+            # structured flow instead of being consumed as general chat.
+            if (
+                request.intent == "general"
+                and str(request.query or "") == "general:employee_list_selected"
+            ):
+                selected = (
+                    state.get("selected_list_employee")
+                    if isinstance(state.get("selected_list_employee"), dict)
+                    else {}
+                )
+                selected_name = str(selected.get("name") or "").strip()
+                focus = (state.get("focus") or {}).get("current") or {}
+                title = str(focus.get("job_title") or focus.get("job_title_ar") or "").strip()
+                if language == "ar":
+                    answer = f"اخترت {selected_name or 'الموظف'}"
+                    if title:
+                        answer += f" — {title}"
+                    answer += ". أقدر أطلع لك بياناته المتاحة، مثل الإيميل أو المنصب، أو أبحث عن مديره."
+                else:
+                    answer = f"You selected {selected_name or 'the employee'}"
+                    if title:
+                        answer += f" — {title}"
+                    answer += ". I can help with their available contact details, role, or manager."
+                print(
+                    f"[List Selection Ack] name={selected_name!r}",
+                    file=sys.stderr,
+                )
+                return finish(answer, save_state=True)
+
+            if request.intent == "general" and request.query == "general:org_hierarchy_unverified":
+                answer = (
+                    "🏢 ما عندي هيكل تنظيمي موثّق يوضح الإدارات التابعة لهذه الإدارة حاليًا، "
+                    "فما راح أعرض قائمة موظفين على أنها إدارات."
+                    if language == "ar" else
+                    "🏢 I don't have a verified organizational hierarchy for this department, "
+                    "so I won't present an employee list as a list of sub-departments."
+                )
+                return finish(answer, save_state=True)
+
+            if request.intent == "general":
+                # Final enterprise safety net: natural self-service wording must
+                # never fall into the open-ended LLM merely because the semantic
+                # model missed the phrasing.
+                enterprise_retry = _critical_orchestrator_preflight(
+                    message,
+                    state,
+                    language,
+                )
+                if enterprise_retry is not None and enterprise_retry.intent != "general":
+                    request = enterprise_retry
+                    print(
+                        f"[Enterprise Safety Route] {request.model_dump()}",
+                        file=sys.stderr,
+                    )
+
+            if request.intent == "general":
+                pending_general = state.get("pending") if isinstance(state.get("pending"), dict) else {}
+
+                # Conversation continuity guard: a short reply to an explicit
+                # pending offer belongs to that offer even when the semantic
+                # model labels the turn as generic chat.
+                if str(pending_general.get("kind") or "") == "tawasul_events_offer":
+                    continuation = _critical_orchestrator_preflight(message, state, language)
+                    if continuation is not None and continuation.intent != "general":
+                        request = continuation
+                        print(
+                            f"[Pending Context Override] {request.model_dump()}",
+                            file=sys.stderr,
+                        )
+
+            if request.intent == "general":
+                pending_general = state.get("pending") if isinstance(state.get("pending"), dict) else {}
+                pending_kind = str(pending_general.get("kind") or "").strip()
+                selection_like = bool(
+                    re.fullmatch(
+                        r"(?:\d{1,2}|الاول|الأول|اول|الثاني|ثاني|الثالث|ثالث|الرابع|رابع|"
+                        r"الخامس|خامس|انا|أنا|نفسي|me|myself|first|second|third|fourth|fifth)",
+                        _norm_role_text(message),
+                        re.I,
                     )
                 )
-                if request.intent == "general" or request.confidence < 0.60 or bool(request.clarification_reason) or strong_closed_grammar:
-                    request = critical_request
-                    print(f"[Critical Fallback] {request.model_dump()}", file=sys.stderr)
-
-            # Only true general conversation goes to the no-tool assistant.
-            if request.intent == "general" and _obvious_general_conversation(message, state):
-                print(f"[Route] general reason=semantic_general msg={message[:80]!r}", file=sys.stderr)
-                answer = await self._general_answer(message, state, language)
-                return finish(answer, save_state=True)
+                if not (pending_kind and selection_like):
+                    print(f"[Route] general reason=semantic_general msg={message[:80]!r}", file=sys.stderr)
+                    answer = await self._general_answer(message, state, language)
+                    return finish(answer, save_state=True)
 
             restored_target = restore_pending_target(request, state)
             has_self_target = any(t.kind == "self" for t in request.targets)
@@ -5268,6 +8517,9 @@ class Orchestrator:
             r"(?:اليوم|بكره|بكرة|غدا|غداً|امس|أمس|هذا\s+الاسبوع|الاسبوع\s+هذا|"
             r"الاسبوع\s+الماضي|هذا\s+الشهر|الشهر\s+الماضي|today|tomorrow|yesterday|"
             r"this\s+week|last\s+week|this\s+month|last\s+month|"
+            r"الاحد|الأحد|احد|أحد|الاثنين|الإثنين|اثنين|الثلاثاء|ثلاثاء|"
+            r"الاربعاء|الأربعاء|اربعاء|أربعاء|الخميس|خميس|الجمعه|الجمعة|جمعه|جمعة|السبت|سبت|"
+            r"sunday|monday|tuesday|wednesday|thursday|friday|saturday|"
             r"\b\d{1,2}[-/]\d{1,2}[-/]\d{4}\b|\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b)",
             temporal_norm, re.I,
         ))
@@ -5276,7 +8528,42 @@ class Orchestrator:
             and all(t.kind in {"self", "none"} for t in request.targets)
             and request.intent in {"meetings", "meeting_list", "employee_availability", "attendance_today", "attendance_history", "working_hours"}
         )
-        if self_temporal and not has_explicit_period and str(request.period or "none") in {"", "none", "today"}:
+
+        # Context is allowed to carry a date across a natural follow-up.
+        # Example: "وش اجتماعاتي اليوم؟" -> "الصباح" must keep TODAY instead
+        # of being reset to missing_date_range simply because the second message
+        # does not repeat the word "اليوم". A model-resolved custom date (e.g.
+        # "الثلاثاء") is also authoritative structurally because it already has
+        # a concrete start_date/end_date.
+        pending_for_temporal = state.get("pending") if isinstance(state.get("pending"), dict) else {}
+        pending_kind_for_temporal = str(pending_for_temporal.get("kind") or "")
+        carries_pending_meeting_date = bool(
+            pending_kind_for_temporal == "meeting_time_window"
+            and request.intent in {"meetings", "meeting_list"}
+            and str(request.period or "none") not in {"", "none"}
+        )
+        has_structured_custom_date = bool(
+            str(request.period or "none") == "custom"
+            and (str(request.start_date or "").strip() or str(request.end_date or "").strip())
+        )
+        # Meeting wizard continuation: once the user selected a day and then a
+        # time window (e.g. today -> morning), the second turn must inherit the
+        # saved day. Do not reset it just because the word "today" is not
+        # repeated in the short follow-up.
+        has_meeting_window_with_date = bool(
+            request.intent in {"meetings", "meeting_list"}
+            and str(getattr(request, "time_query", "") or "").strip()
+            and str(request.period or "none") not in {"", "none"}
+        )
+
+        if (
+            self_temporal
+            and not has_explicit_period
+            and not carries_pending_meeting_date
+            and not has_structured_custom_date
+            and not has_meeting_window_with_date
+            and str(request.period or "none") in {"", "none", "today"}
+        ):
             request.period = "none"
             request.start_date = ""
             request.end_date = ""
@@ -5330,7 +8617,7 @@ class Orchestrator:
                 if request.intent == "employee_availability":
                     prompt = "أكيد، أي يوم أو فترة تبيني أشيك لك؟ اليوم، بكرة، أو تاريخ محدد؟"
                 elif request.intent in {"meetings", "meeting_list"}:
-                    prompt = "أكيد، تبيني أشوف اجتماعاتك متى؟ اليوم، بكرة، أو فترة محددة؟"
+                    prompt = "أكيد 😊 متى تبي أشيك اجتماعاتك؟ اليوم، بكرة، أو يوم معيّن؟"
                 elif request.intent in {"attendance_today", "attendance_history"}:
                     prompt = "أكيد، أي يوم تبيني أشيك حضورك فيه؟ اليوم، أمس، أو تاريخ محدد؟"
                 elif request.intent == "working_hours":
@@ -5341,12 +8628,62 @@ class Orchestrator:
                 if request.intent == "employee_availability":
                     prompt = "Sure — what day or time period should I check: today, tomorrow, or a specific date?"
                 elif request.intent in {"meetings", "meeting_list"}:
-                    prompt = "Sure — when should I check your meetings: today, tomorrow, or a specific period?"
+                    prompt = "Sure 😊 What day would you like me to check your meetings — today, tomorrow, or a specific date?"
                 elif request.intent in {"attendance_today", "attendance_history", "working_hours"}:
                     prompt = "Sure — which day or period should I check?"
                 else:
                     prompt = "Sure — which period do you want?"
             return finish(prompt)
+
+        # For own meetings, ask for the desired part of the selected day before
+        # calling the calendar API. Persist that selected day in BOTH pending
+        # and meeting_context so the next short reply ("الصباح") cannot fall
+        # back to today.
+        if (
+            request.intent in {"meetings", "meeting_list"}
+            and request.clarification_reason == ""
+            and request.period != "none"
+            and not str(getattr(request, "time_query", "") or "").strip()
+            and str((state.get("meeting_context") or {}).get("mode") or "") == "self_meetings_wizard"
+            and str((state.get("pending") or {}).get("kind") or "") == "meeting_time_window"
+        ):
+            state["meeting_context"] = {
+                "subject_kind": "self",
+                "employee": {},
+                "period": request.period,
+                "start_date": request.start_date,
+                "end_date": request.end_date,
+                "time_query": "",
+                "mode": "self_meetings",
+            }
+            _record_request(state, request)
+            state["pending"] = {
+                "kind": "meeting_time_window",
+                "query": "",
+                "candidates": [],
+                "request": request.model_dump(),
+                "message": message,
+            }
+
+            if language == "ar":
+                selected_day = "اليوم"
+                if request.period == "tomorrow":
+                    selected_day = "بكرة"
+                elif request.period == "custom" and request.start_date:
+                    try:
+                        from datetime import datetime as _dt
+                        day_idx = _dt.fromisoformat(str(request.start_date)).weekday()
+                        selected_day = {
+                            0: "الاثنين", 1: "الثلاثاء", 2: "الأربعاء",
+                            3: "الخميس", 4: "الجمعة", 5: "السبت", 6: "الأحد",
+                        }.get(day_idx, "اليوم المحدد")
+                    except Exception:
+                        selected_day = "اليوم المحدد"
+                elif request.period not in {"today", "tomorrow"}:
+                    selected_day = "الفترة المحددة"
+                return finish(f"تمام، تبيني أشيك لك {selected_day} الصباح، بعد الظهر، أو المساء؟")
+
+            return finish("Sure — should I check the morning, afternoon, or evening?")
 
         if request.clarification_reason == "missing_contact_subject":
             return finish(
@@ -5398,6 +8735,19 @@ class Orchestrator:
                     file=sys.stderr,
                 )
 
+        # v203: "مديري / مين مديري / my manager" always means the
+        # authenticated user's manager when no explicit employee target exists.
+        # Do this before generic person-scoped validation so we never ask
+        # "تقصد لك أنت ولا لموظف معين؟" for an unambiguous self-manager request.
+        if request.intent == "manager" and not [t for t in request.targets if t.kind != "none"]:
+            request.targets = [TargetRef(kind="self", name="")]
+            request.clarification_reason = ""
+            request.confidence = max(float(request.confidence or 0.0), 0.99)
+            print(
+                f"[Manager Self Route] fields={request.fields!r} depth={request.relation_depth}",
+                file=sys.stderr,
+            )
+
         validation = validate_request(request, state, language=language)
         if not validation.ok:
             # RCRC-FIX-v2: keep the question so "انا" / a name can complete it.
@@ -5419,7 +8769,11 @@ class Orchestrator:
             reason = "writing" if str(request.query or "") == "general:writing" else "semantic_parser"
             print(f"[Route] general reason={reason} msg={message[:80]!r}", file=sys.stderr)
             facts = await self._writing_facts(message, employee_context, language, state) if reason == "writing" else {}
-            answer = await self._general_answer(message, state, language, facts)
+            if reason == "writing" and _is_email_drafting_request(message):
+                answer = await self._email_draft_answer(message, language, facts)
+                print("[Email Draft Route] direct_writing", file=sys.stderr)
+            else:
+                answer = await self._general_answer(message, state, language, facts)
             _record_request(state, request)
             return finish(answer)
 
@@ -5513,7 +8867,7 @@ class Orchestrator:
                 return finish("ما عندك صلاحية للوصول لهذي المعلومة." if language == "ar" else "You don't have permission to access that information.")
             except EmployeeAPIError as exc:
                 print(f"[Resolver API error] {exc}", file=sys.stderr)
-                return finish("آسف 😅 ما قدرت أوصل لبيانات الموظفين هالمرة. وأنا لسه في مرحلتي التجريبية، وقاعد أتعلم وأتطور باستمرار." if language == "ar" else "Sorry, I couldn't reach employee information this time. I'm still in my experimental phase and continuing to learn and improve.")
+                return finish("آسف 😅 أنا لسه بمرحلتي التجريبية وما قدرت أتحقق من بيانات الموظفين هالمرة، فما راح أعرض لك بيانات غير مؤكدة." if language == "ar" else "Sorry, I couldn't reach employee information this time. I'm still in my experimental phase and continuing to learn and improve.")
 
             if resolution.clarification:
                 return finish(resolution.clarification)
@@ -5546,7 +8900,7 @@ class Orchestrator:
                     who = display_name or "هو"
                     day = "اليوم" if request.period == "today" else "بكرة" if request.period == "tomorrow" else "هالفترة"
                     return finish(
-                        f"أكيد، أبغى أحددها لك بشكل أدق. تبي أشوف متى {who} فاضي {day} **الصباح، الظهر/العصر، ولا المساء**؟",
+                        f"أكيد، أبغى أحددها لك بشكل أدق. تبي أشوف متى {who} فاضي {day} الصباح، الظهر/العصر، ولا المساء؟",
                         save_state=True,
                     )
                 who = display_name or "they"
@@ -5562,7 +8916,92 @@ class Orchestrator:
             base_mode = "free" if str(request.query or "free").startswith("free") else str(request.query or "busy")
             request.query = f"{base_mode}:{availability_window}"
 
-        answer = await self._execute_request(request, resolved_targets, employee_context, language, state)
+        if str(request.query or "") == "general:list_selection_out_of_range":
+            items = (
+                state.get("list_state", {}).get("items", [])
+                if isinstance(state.get("list_state"), dict)
+                else []
+            )
+            count = len(items) if isinstance(items, list) else 0
+            answer = (
+                f"الرقم اللي اخترته مو موجود في القائمة 😊 اختر رقم من 1 إلى {count}."
+                if language == "ar"
+                else f"That number isn't in the list. Choose a number from 1 to {count}."
+            )
+        else:
+            answer = await self._execute_request(request, resolved_targets, employee_context, language, state)
+        if request.intent != "general":
+            answer = polish_response(answer, language=language)
+
+        # v235 Displayed-Offer Guarantee:
+        # If سند visibly offers to show hidden Tawasul items, persist that exact
+        # action here, at the final answer boundary. This keeps UI text and
+        # conversation state synchronized even if an inner renderer/execution
+        # branch did not save pending state for any reason.
+        if (
+            request.intent in {"meetings", "meeting_list"}
+            and str(request.query or "").strip() != "meetings:tawasul"
+            and isinstance(answer, str)
+            and (
+                "إذا تحب أعرضها لك" in answer
+                or "إذا تحب، أعرضها لك" in answer
+                or "I can show them if you'd like" in answer
+            )
+        ):
+            follow_req = request.model_copy(deep=True)
+            follow_req.query = "meetings:tawasul"
+            follow_req.clarification_reason = ""
+            follow_req.confidence = 1.0
+            state["pending"] = {
+                "kind": "tawasul_events_offer",
+                "query": "",
+                "candidates": [],
+                "request": follow_req.model_dump(),
+                "message": "displayed_tawasul_offer",
+            }
+            print(
+                f"[Displayed Offer Saved] kind='tawasul_events_offer' "
+                f"period={request.period!r} start={request.start_date!r} "
+                f"end={request.end_date!r}",
+                file=sys.stderr,
+            )
+
+        # v241 Tarasol displayed-offer guarantee:
+        # Keep UI text and conversation state synchronized. If the answer that
+        # actually reached the user asks whether to show Tarasol details, the
+        # next short confirmation must resolve to tarasol_details.
+        if (
+            request.intent == "tarasol_count"
+            and isinstance(answer, str)
+            and (
+                "تحب أعرض لك تفاصيلها؟" in answer
+                or "تحب أعرض لك التفاصيل؟" in answer
+                or "Would you like me to show the details?" in answer
+            )
+        ):
+            follow_req = request.model_copy(deep=True)
+            follow_req.intent = "tarasol_details"
+            follow_req.operation = "details"
+            follow_req.targets = [TargetRef(kind="self", name="")]
+            follow_req.fields = ["all"]
+            follow_req.query = "tarasol:self_details"
+            follow_req.clarification_reason = ""
+            follow_req.confidence = 1.0
+            state["pending"] = {
+                "kind": "tarasol_details_offer",
+                "query": "",
+                "candidates": [],
+                "request": follow_req.model_dump(),
+                "message": "displayed_tarasol_offer",
+            }
+            print(
+                "[Displayed Offer Saved] kind='tarasol_details_offer'",
+                file=sys.stderr,
+            )
+
+        if isinstance(answer, str):
+            answer = answer.replace("**", "")
+
         focus_after = state.get("focus") if isinstance(state.get("focus"), dict) else {}
         current_after = focus_after.get("current") if isinstance(focus_after.get("current"), dict) else {}
         print(
@@ -5637,7 +9076,7 @@ class Orchestrator:
                 break
 
         language = detect_language(original, fallback="ar")
-        combined = _friendly_surface(_combine_compound_answers(answers, language), language)
+        combined = polish_response(_combine_compound_answers(answers, language), language=language)
         self.memory.append_message(memory_key, "assistant", combined)
         return combined, [], list(dict.fromkeys(sources))
 
